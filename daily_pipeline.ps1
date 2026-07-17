@@ -38,15 +38,17 @@
      11. meta-manager produce-factors                     (split/div -> read-time factors)
     SQL ROLLUP
      12. sec_filing_signals_rollup.sql                    (needs filing_events from #9)
-    SCORERS (GPU = this PC's RTX 4090; annotation-tier, best-effort, -SkipScorers)
+    SCORER (GPU = this PC's RTX 4090; annotation-tier, best-effort, -SkipScorers)
      13. news_scorer.py --aggregate                       (-> news_signal_daily; feeds
                                                           the selection news-veto in #16)
-     14. sec_text_metrics.py                              (-> filing_text_metrics)
-    GOLD (one command: resume --all incremental + the 4 fundamentals calcs; the
-          options silver landed above is revived here as options_vol_metrics)
-     15. gold-calculator nightly                          ($env:RUST_MIN_STACK raised;
-                                                          --with-prev-month auto-added
-                                                          in the first days of a month)
+          (sec_text_metrics.py is intentionally NOT run — the 2026-07 change_score
+           study found its signal not worth the nightly GPU cost; on-demand only)
+    GOLD (resume --all: event-driven + incremental. The fundamentals chain fires
+          via events — fundamental_features off meta-manager's fundamentals_published,
+          then rating -> group_strength -> composite_rating_v2 off gold_published;
+          options_vol_metrics is revived off the options silver landed above)
+     14. gold-calculator resume --all                     (the binary sets its own 256 MB
+                                                          stack, no env var needed)
     SELECTION ("Today's Longs")
      16. selection_rollup.sql                             (needs crv2 + regime +
                                                           realized_volatility fresh)
@@ -66,8 +68,8 @@
   already-downloaded day.
 
 .PARAMETER SkipScorers
-  Skip the GPU Python scorers (stages 13-14) — e.g. an unattended host with no
-  GPU, or to keep the run pure-Rust/SQL.
+  Skip the GPU news scorer (stage 13) — e.g. an unattended host with no GPU, or
+  to keep the run pure-Rust/SQL.
 
 .PARAMETER Force
   Run even when the prior session was a non-trading day (bypass the holiday
@@ -252,23 +254,27 @@ try {
     # ── SQL ROLLUP (SEC filing signals) — needs filing_events from meta resume ─
     Invoke-Sql 'sec_filing_signals_rollup' (Join-Path $SqlDir 'sec_filing_signals_rollup.sql') -StopOnError
 
-    # ── SCORERS (GPU; annotation-tier, best-effort) ──────────────────────────
+    # ── SCORER (GPU; annotation-tier, best-effort) ───────────────────────────
     if ($SkipScorers) {
-        Write-Log 'scorers (stages 13-14) skipped by -SkipScorers'
+        Write-Log 'news_scorer skipped by -SkipScorers'
     } else {
-        Invoke-Py 'news_scorer'      @('-3.13', 'scripts/news_scorer.py', '--aggregate')
-        Invoke-Py 'sec_text_metrics' @('-3.13', 'scripts/sec_text_metrics.py')
+        Invoke-Py 'news_scorer' @('-3.13', 'scripts/news_scorer.py', '--aggregate')
+        # sec_text_metrics is intentionally NOT run: the 2026-07 change_score
+        # event study found the SEC-filing text signal weak/short-lived and not
+        # worth the nightly GPU cost. Run on demand only if revisiting the study.
+        # Invoke-Py 'sec_text_metrics' @('-3.13', 'scripts/sec_text_metrics.py')
     }
 
-    # ── GOLD (one command: resume --all + fundamentals four; options_vol_metrics
-    #    is revived here off the options silver landed above) ──────────────────
-    $env:RUST_MIN_STACK = '67108864'
-    $goldArgs = @('--env', $Env, 'nightly')
-    if ((Get-Date).Day -le 3) {
-        $goldArgs += '--with-prev-month'
-        Write-Log 'gold: first days of month — adding --with-prev-month (late data lands in prior month)'
-    }
-    Invoke-Stage 'gold-calculator nightly' $GoldExe $goldArgs
+    # ── GOLD (resume --all: event-driven, incremental. Walks the DAG in phase
+    #    order, so the fundamentals chain fires via events — fundamental_features
+    #    off meta-manager's `fundamentals_published` (stage 9), then rating ->
+    #    industry_group_strength -> composite_rating_v2 off `gold_published`. Late
+    #    prior-month fundamentals revive their own as-of month (the event carries
+    #    it), so no --with-prev-month heuristic is needed. options_vol_metrics is
+    #    revived off the options silver landed above. The binary sets its own
+    #    256 MB stack (build.rs /STACK + tokio thread_stack_size + main.rs
+    #    RUST_MIN_STACK override), so no $env:RUST_MIN_STACK is needed. ──────────
+    Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
