@@ -26,13 +26,9 @@
       3. downloader download --schedule catalog_enrich --vendor eodhd  (IPO/newcomers)
       4. downloader download --schedule sec_daily --vendor sec         (last-7d filings)
       5. downloader download --schedule options_daily --throttle 200 --concurrency 8
-      6. downloader resume --throttle 200 --concurrency 8 (drain budget-deferred items
-                                                          from #1-5 + standing backfills;
-                                                          a bare resume sweeps ALL pending
-                                                          across pools, so the throttle
-                                                          rate-limits the options backfill.
-                                                          NOTE: it also throttles any
-                                                          main-pool mop-up to 200/min)
+      (no blanket `downloader resume` — deliberately. Each schedule above drains
+       its own throughput-sized plan; standing backfills are drained MANUALLY
+       after inspecting what's pending. See the note at the stage site below.)
     TRANSFORM / SILVER (raw -> bronze -> silver; one pass drains equity + options)
       7. transformer-v2 resume
       8. silver-refiner resume                            (auto-resamples unadj 5min)
@@ -229,10 +225,19 @@ try {
         Invoke-Stage 'download catalog_enrich' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'catalog_enrich', '--vendor', 'eodhd')
         Invoke-Stage 'download sec_daily'      $DownloaderExe @('--env', $Env, 'download', '--schedule', 'sec_daily', '--vendor', 'sec')
         Invoke-Stage 'download options_daily'  $DownloaderExe @('--env', $Env, 'download', '--schedule', 'options_daily', '--throttle', '200', '--concurrency', '8')
-        # Bare resume drains ALL pending across pools; --throttle/--concurrency
-        # rate-limit the options (marketplace-pool) backfill. Applies to the
-        # whole eodhd resume, so main-pool mop-up is also capped at 200/min.
-        Invoke-Stage 'downloader resume' $DownloaderExe @('--env', $Env, 'resume', '--throttle', '200', '--concurrency', '8')
+        # NOTE: a blanket `downloader resume` is intentionally NOT run nightly.
+        # A bare resume sweeps ALL pending across pools unattended (the options
+        # marketplace backfill, catalog_enrich leftovers, any budget-deferred
+        # daily items). Each schedule above already drains its own
+        # throughput-sized plan, so standing backfills are drained MANUALLY when
+        # you choose — inspect first, then scope the drain:
+        #   # what's pending, by run:
+        #   docker exec quantvector-db psql -U quantvector -d quantvector -c \
+        #     "SELECT run_id, count(*) FROM plan_items \
+        #      WHERE planning_status='ok' AND download_status='pending' \
+        #      GROUP BY run_id ORDER BY count(*) DESC;"
+        #   # then drain a specific run (options at 200/min, 8 concurrent):
+        #   downloader --env prod resume --run-id <run_id> --throttle 200 --concurrency 8
     }
 
     # ── TRANSFORM / SILVER ───────────────────────────────────────────────────
