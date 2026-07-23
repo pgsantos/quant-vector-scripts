@@ -26,6 +26,11 @@
       3. downloader download --schedule catalog_enrich --vendor eodhd  (IPO/newcomers)
       4. downloader download --schedule sec_daily --vendor sec         (last-7d filings)
       5. downloader download --schedule options_daily --throttle 200 --concurrency 8
+      5w. downloader download --schedule rename_reconcile --vendor eodhd
+          WEEKLY (Saturday run only — post-Friday close). Full-history rename
+          pull; the only one once the nightly job carries lookback_days: 60.
+          All WEEKLY stages gate on $IsWeekly — Saturday, NOT Sunday: this
+          pipeline skips non-trading days, so Sun/Mon 00:00 never run.
       (no blanket `downloader resume` — deliberately. Each schedule above drains
        its own throughput-sized plan; standing backfills are drained MANUALLY
        after inspecting what's pending. See the note at the stage site below.)
@@ -85,7 +90,10 @@ param(
     [switch]$SkipScorers,
     # Run even if the prior session was a non-trading day (e.g. to process the
     # crypto/fx that DO trade on equity holidays, or to backfill).
-    [switch]$Force
+    [switch]$Force,
+    # Run the WEEKLY stages regardless of weekday (they normally fire only on
+    # the Saturday 00:00 run). Use to catch up a missed week, or to test.
+    [switch]$ForceWeekly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -216,6 +224,22 @@ if (-not $Force) {
     }
 }
 
+# ─── Weekly gate ──────────────────────────────────────────────────────────
+# WEEKLY stages run on the Saturday 00:00 run — the first run after Friday's
+# close, so a full trading week is in the books.
+#
+# 🚨 NOT Sunday. This pipeline processes the PRIOR session and the guard above
+# exits on a non-trading day, so Sunday 00:00 (prior session = Saturday) and
+# Monday 00:00 (prior session = Sunday) never run. The effective cadence is
+# Tue-Sat; a Sunday-gated stage would silently never fire.
+$IsWeekly = $ForceWeekly -or ((Get-Date).DayOfWeek -eq 'Saturday')
+if ($IsWeekly) {
+    $why = if ($ForceWeekly) { '-ForceWeekly' } else { 'Saturday run (post-Friday close)' }
+    Write-Log "weekly stages ENABLED this run — $why"
+} else {
+    Write-Log "weekly stages skipped (not the Saturday run; use -ForceWeekly to override)"
+}
+
 Push-Location $Repo   # so the apps find .env via load_env_from_ancestors
 try {
     # ── DOWNLOAD ─────────────────────────────────────────────────────────────
@@ -227,6 +251,28 @@ try {
         Invoke-Stage 'download catalog_enrich' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'catalog_enrich', '--vendor', 'eodhd')
         Invoke-Stage 'download sec_daily'      $DownloaderExe @('--env', $Env, 'download', '--schedule', 'sec_daily', '--vendor', 'sec')
         Invoke-Stage 'download options_daily'  $DownloaderExe @('--env', $Env, 'download', '--schedule', 'options_daily', '--throttle', '200', '--concurrency', '8')
+
+        # ── WEEKLY downloads (Saturday run only — see the weekly gate above) ──
+        if ($IsWeekly) {
+            # FULL rename reconcile: /symbol-change-history from 2000 -> today.
+            # 1 API call/week, and the ONLY full-history pull once the nightly
+            # `symbol_changes` job carries `lookback_days: 60`.
+            #
+            # LOAD-BEARING, not insurance. A rename only enters
+            # symbol_change_events once its OLD ticker exists in `symbols` (the
+            # insert gate). A ticker can join our universe YEARS after its
+            # rename — 9 such renames surfaced at once on 2026-07-21 with
+            # effective dates spanning 2022-2025. Those records sit far outside
+            # a 60-day window, so without this weekly full re-process the
+            # nightly would never see them again. This bounds that latency to
+            # <= 1 week, which is fine for historical renames (they land in a
+            # review inbox, not a trading path).
+            #
+            # Placed in the download phase on purpose: `meta-manager resume`
+            # (stage 9 below) parses the landed file in the SAME run.
+            Invoke-Stage 'download rename_reconcile' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'rename_reconcile', '--vendor', 'eodhd')
+        }
+
         # NOTE: a blanket `downloader resume` is intentionally NOT run nightly.
         # A bare resume sweeps ALL pending across pools unattended (the options
         # marketplace backfill, catalog_enrich leftovers, any budget-deferred
