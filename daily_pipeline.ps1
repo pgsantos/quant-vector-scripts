@@ -320,7 +320,12 @@ try {
     #    revived off the options silver landed above. The binary sets its own
     #    256 MB stack (build.rs /STACK + tokio thread_stack_size + main.rs
     #    RUST_MIN_STACK override), so no $env:RUST_MIN_STACK is needed. ──────────
-    Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
+    # ⚠️ 2026-07-24: switched resume -> calculate for the weekend full rebuild
+    # (fold in the earnings sentinel + VIX fixes). `calculate --all` bypasses the
+    # event log and unconditionally recomputes EVERY enabled calculator (~heavy,
+    # full-history cross-sectional). REVERT to `resume --all` after the weekend
+    # rebuild lands — leaving this makes every weekday nightly a full rebuild.
+    Invoke-Stage 'gold-calculator calculate --all' $GoldExe @('--env', $Env, 'calculate', '--all')
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
