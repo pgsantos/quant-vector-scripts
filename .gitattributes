@@ -1,0 +1,7 @@
+# Normalize line endings to LF on checkin, regardless of editor or platform.
+#
+# 2026-07-24: daily_pipeline.ps1 showed a 713-line diff containing ZERO content
+# changes -- every line differed only by CRLF vs LF after an editor rewrote it.
+# The same thing had happened to all 14 configs in the sibling config repo.
+# Without this, real changes are impossible to find in the noise.
+* text=auto eol=lf

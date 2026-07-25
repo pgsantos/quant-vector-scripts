@@ -345,6 +345,27 @@ try {
     Write-Log "server cache refresh skipped (server not running?): $($_.Exception.Message)" 'WARN'
 }
 
+# ─── Stage 18: completion sentinel for downstream consumers ──────────────────
+# The Claude quant-briefing scheduled task gates on pipeline completion: it will
+# not build a briefing until the nightly has actually landed, so a slow run (e.g.
+# a `calculate --all` full rebuild) no longer produces a briefing on stale data.
+# The briefing checks the database first; this sentinel adds the one thing the DB
+# cannot tell it - whether the run SUCCEEDED or logged failures. Best-effort: a
+# failure here must NOT fail the pipeline.
+try {
+    $sentinelPath = Join-Path $Lakehouse '.pipeline-complete.json'
+    [pscustomobject]@{
+        completed_utc = (Get-Date).ToUniversalTime().ToString('o')
+        status        = if ($script:Failures.Count) { 'FAILURES' } else { 'OK' }
+        failures      = @($script:Failures)
+        log_file      = $LogFile
+        run_stamp     = $stamp
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $sentinelPath -Encoding UTF8
+    Write-Log ("completion sentinel written: {0}" -f $sentinelPath)
+} catch {
+    Write-Log "sentinel write skipped: $($_.Exception.Message)" 'WARN'
+}
+
 if ($script:Failures.Count) {
     Write-Log ("DONE with FAILURES: {0}" -f ($script:Failures -join ', ')) 'ERROR'
     exit 1
