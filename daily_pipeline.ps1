@@ -26,6 +26,9 @@
       3. downloader download --schedule catalog_enrich --vendor eodhd  (IPO/newcomers)
       4. downloader download --schedule sec_daily --vendor sec         (last-7d filings)
       5. downloader download --schedule options_daily --throttle 200 --concurrency 8
+      5x. downloader download --schedule capacity_weekly --vendor capacity
+          WEEKLY (Saturday). FRED monthly + EIA weekly series behind the
+          capital_cycle capacity leg; nightly would re-fetch identical bytes.
       5w. downloader download --schedule rename_reconcile --vendor eodhd
           WEEKLY (Saturday run only — post-Friday close). Full-history rename
           pull; the only one once the nightly job carries lookback_days: 60.
@@ -271,6 +274,22 @@ try {
             # Placed in the download phase on purpose: `meta-manager resume`
             # (stage 9 below) parses the landed file in the SAME run.
             Invoke-Stage 'download rename_reconcile' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'rename_reconcile', '--vendor', 'eodhd')
+
+            # Macro capacity utilization (FRED + EIA) -> macro_capacity, the
+            # capital_cycle capacity leg. WEEKLY on purpose: the FRED series are
+            # MONTHLY and the EIA one WEEKLY, so a nightly pull would re-fetch
+            # byte-identical payloads six days in seven. Free APIs, 4 requests,
+            # no EODHD budget.
+            #
+            # Without this the overlay silently FREEZES at whatever vintage was
+            # last landed: capital_cycle keeps scoring, the capacity leg keeps
+            # returning a value, and nothing reports that the value has stopped
+            # moving. Same shape as every other defect this feature found.
+            #
+            # Placed in the download phase on purpose, like rename_reconcile:
+            # `meta-manager resume` (stage 9) parses the landed files in the
+            # SAME run, so a Saturday night lands data AND projects it.
+            Invoke-Stage 'download capacity_weekly' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'capacity_weekly', '--vendor', 'capacity')
         }
 
         # NOTE: a blanket `downloader resume` is intentionally NOT run nightly.
