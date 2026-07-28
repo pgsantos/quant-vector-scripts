@@ -43,6 +43,7 @@
     METADATA PROJECTIONS (raw metadata/fundamentals/filings -> PG tables)
       9. meta-manager resume
      10. meta-manager sync-catalog                        (catalog -> symbols lifecycle)
+     10b. meta-manager sync-corporate-actions             (delist/listing bridge; breaker-capped)
      11. meta-manager produce-factors                     (split/div -> read-time factors)
     SQL ROLLUP
      12. sec_filing_signals_rollup.sql                    (needs filing_events from #9)
@@ -317,6 +318,13 @@ try {
     # ── METADATA PROJECTIONS ─────────────────────────────────────────────────
     Invoke-Stage 'meta-manager resume'          $MetaExe @('--env', $Env, 'resume')
     Invoke-Stage 'meta-manager sync-catalog'    $MetaExe @('--env', $Env, 'sync-catalog')
+    # Bridge catalog delistings/listings into corporate_actions (Phase 2 step
+    # 1b). AFTER sync-catalog on purpose: that is what stamps the derived
+    # delist dates this reads. Idempotent, cheap, and the historical backfill
+    # already ran (2026-07-27, 32,483 rows) — this is the daily trickle.
+    # Listing circuit breaker: a burst beyond the default cap inserts NOTHING
+    # and says why (a vendor-side catalog import, not a listing wave).
+    Invoke-Stage 'meta-manager sync-corporate-actions' $MetaExe @('--env', $Env, 'sync-corporate-actions')
     Invoke-Stage 'meta-manager produce-factors' $MetaExe @('--env', $Env, 'produce-factors')
 
     # ── SQL ROLLUP (SEC filing signals) — needs filing_events from meta resume ─
