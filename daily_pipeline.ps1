@@ -44,6 +44,7 @@
       9. meta-manager resume
      10. meta-manager sync-catalog                        (catalog -> symbols lifecycle)
      10b. meta-manager sync-corporate-actions             (delist/listing bridge; breaker-capped)
+     10c. meta-manager extract-deal-terms                 (8-K M&A/spinoff facts; 10-day window)
      11. meta-manager produce-factors                     (split/div -> read-time factors)
     SQL ROLLUP
      12. sec_filing_signals_rollup.sql                    (needs filing_events from #9)
@@ -325,6 +326,13 @@ try {
     # Listing circuit breaker: a burst beyond the default cap inserts NOTHING
     # and says why (a vendor-side catalog import, not a listing wave).
     Invoke-Stage 'meta-manager sync-corporate-actions' $MetaExe @('--env', $Env, 'sync-corporate-actions')
+    # Extract M&A deal terms + spinoffs from newly landed 8-Ks (Phase 2 steps
+    # 2+3, PHASE2 doc §18-§19). AFTER meta resume on purpose: that is what
+    # lands the raw filings and classifies filing_events.items this walks.
+    # Default 10-day window; idempotent (identity-deduped both tables); the
+    # historical backfill already ran (2026-07-29, 69/98/3 rows verified).
+    # Uncertain classification = NO row; skips are named in the stage log.
+    Invoke-Stage 'meta-manager extract-deal-terms' $MetaExe @('--env', $Env, 'extract-deal-terms')
     Invoke-Stage 'meta-manager produce-factors' $MetaExe @('--env', $Env, 'produce-factors')
 
     # ── SQL ROLLUP (SEC filing signals) — needs filing_events from meta resume ─
