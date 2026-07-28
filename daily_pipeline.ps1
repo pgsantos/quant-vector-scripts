@@ -350,12 +350,13 @@ try {
     #    revived off the options silver landed above. The binary sets its own
     #    256 MB stack (build.rs /STACK + tokio thread_stack_size + main.rs
     #    RUST_MIN_STACK override), so no $env:RUST_MIN_STACK is needed. ──────────
-    # ⚠️ 2026-07-24: switched resume -> calculate for the weekend full rebuild
-    # (fold in the earnings sentinel + VIX fixes). `calculate --all` bypasses the
-    # event log and unconditionally recomputes EVERY enabled calculator (~heavy,
-    # full-history cross-sectional). REVERT to `resume --all` after the weekend
-    # rebuild lands — leaving this makes every weekday nightly a full rebuild.
-    Invoke-Stage 'gold-calculator calculate --all' $GoldExe @('--env', $Env, 'calculate', '--all')
+    # 2026-07-28: REVERTED to `resume --all` (the 07-24 calculate-mode switch for
+    # the weekend rebuild was left in place and made the 07-28 weekday nightly a
+    # full rebuild — killed mid new_highs, ~6h in, 4 of 24 calculators done).
+    # If a full rebuild is ever needed again: run `calculate --all` MANUALLY,
+    # never by editing this stage — an edit here outlives the weekend it was
+    # made for, which is exactly what happened.
+    Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
 
     # ── THESIS OUTCOME LOG (upstream thesis, SPEC-thesis-event-outcomes) ────────
     # Explicit and UNFILTERED, deliberately — this cannot ride resume/calculate
