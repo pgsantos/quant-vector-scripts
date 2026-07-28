@@ -57,6 +57,9 @@
           options_vol_metrics is revived off the options silver landed above)
      14. gold-calculator resume --all                     (the binary sets its own 256 MB
                                                           stack, no env var needed)
+     15. thesis_event_outcomes calculate                  (explicit + unfiltered: no event
+                                                          feeds it, and it rewrites every
+                                                          prior month as horizons mature)
     SELECTION ("Today's Longs")
      16. selection_rollup.sql                             (needs crv2 + regime +
                                                           realized_volatility fresh)
@@ -345,6 +348,20 @@ try {
     # full-history cross-sectional). REVERT to `resume --all` after the weekend
     # rebuild lands — leaving this makes every weekday nightly a full rebuild.
     Invoke-Stage 'gold-calculator calculate --all' $GoldExe @('--env', $Env, 'calculate', '--all')
+
+    # ── THESIS OUTCOME LOG (upstream thesis, SPEC-thesis-event-outcomes) ────────
+    # Explicit and UNFILTERED, deliberately — this cannot ride resume/calculate
+    # --all like the others:
+    #   * no pub/sub event feeds it (it is a RECORD, not an input), so the
+    #     claim-driven paths never schedule it;
+    #   * claims are month-scoped, and this calculator must rewrite EVERY prior
+    #     month each run — forward horizons (63-504 trading days) mature long
+    #     after their snapshot was written, and a month filter would silently
+    #     freeze old partitions' maturation.
+    # Daily and cheap; runs after the gold stage so capital_cycle_name and
+    # daily_returns are fresh. Refuses to write (exit 1) if a thesis is somehow
+    # invalidated on its own entry date — that is a producer bug, not data.
+    Invoke-Stage 'thesis_event_outcomes calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'thesis_event_outcomes', '--instrument', 'stock')
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
