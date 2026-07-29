@@ -59,6 +59,8 @@
           options_vol_metrics is revived off the options silver landed above)
      14. gold-calculator resume --all                     (the binary sets its own 256 MB
                                                           stack, no env var needed)
+     14b. special_situations calculate                    (explicit; feeds the thesis log's
+                                                           special_situations funnel)
      15. thesis_event_outcomes calculate                  (explicit + unfiltered: no event
                                                           feeds it, and it rewrites every
                                                           prior month as horizons mature)
@@ -365,6 +367,17 @@ try {
     # never by editing this stage — an edit here outlives the weekend it was
     # made for, which is exactly what happened.
     Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
+
+    # ── SPECIAL SITUATIONS (PHASE2 §21-§24) ─────────────────────────────────────
+    # Daily snapshot of structural triggers (spinoffs, live M&A targets from
+    # ma_deal_terms_live, insider clusters, buybacks). Explicit like the thesis
+    # stage: no pub/sub event feeds it (its sources are PG tables the ledger
+    # does not track), so claim-driven paths never schedule it. Same-day
+    # idempotent; minutes. Runs AFTER 10c (extract-deal-terms feeds the live
+    # view) and BEFORE the thesis stage, which ingests its month-end rows as
+    # funnel='special_situations'. Refuses to run if the live view's staleness
+    # constant drifts from config (pg_get_viewdef pin).
+    Invoke-Stage 'special_situations calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'special_situations', '--instrument', 'stock')
 
     # ── THESIS OUTCOME LOG (upstream thesis, SPEC-thesis-event-outcomes) ────────
     # Explicit and UNFILTERED, deliberately — this cannot ride resume/calculate
