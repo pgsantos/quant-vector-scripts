@@ -59,6 +59,9 @@
           options_vol_metrics is revived off the options silver landed above)
      14. gold-calculator resume --all                     (the binary sets its own 256 MB
                                                           stack, no env var needed)
+     14a. refresh_symbols_first_bar_date.sql              (symbols.first_bar_date for names
+                                                           that just gained a first bar;
+                                                           reads daily_returns, so AFTER 14)
      14b. special_situations calculate                    (explicit; feeds the thesis log's
                                                            special_situations funnel)
      15. thesis_event_outcomes calculate                  (explicit + unfiltered: no event
@@ -368,6 +371,28 @@ try {
     # made for, which is exactly what happened.
     Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
 
+    # ── symbols.first_bar_date (2026-07-31) ─────────────────────────────────────
+    # The pipeline's OWN earliest observed bar per (instrument, symbol) — the
+    # only listing-date leg not sourced from EODHD, and so the only one that can
+    # contradict `ipo_calendar` and `company_profiles.ipo_date` when they agree
+    # with each other and are both wrong.
+    #
+    # AFTER stage 14: it reads daily_returns, so a name that first traded today
+    # needs today's gold to have landed. Seeded once by
+    # migrations/2026-07-31b_listing_provenance.sql (2m48s, 33,340 rows); this
+    # only fills names that have gained a first bar since.
+    #
+    # 🚨 -StopOnError deliberately. Without ON_ERROR_STOP psql can exit 0 with a
+    # failed statement, and this stage would report OK forever while
+    # first_bar_date silently froze — the wired-but-blind shape (DQ-17).
+    #
+    # Bounded by design, and the obvious formulations are NOT: the seed's full
+    # GROUP BY costs 168s per run even when it updates nothing, and a
+    # per-symbol probe over NULL rows costs 52s because 49,662 symbols have no
+    # bars at all and get re-probed nightly forever. The shipped form filters on
+    # trade_date first (chunk exclusion) and measures 0.14s on prod.
+    Invoke-Sql 'refresh symbols.first_bar_date' (Join-Path $SqlDir 'refresh_symbols_first_bar_date.sql') -StopOnError
+
     # ── SPECIAL SITUATIONS (PHASE2 §21-§24) ─────────────────────────────────────
     # Daily snapshot of structural triggers (spinoffs, live M&A targets from
     # ma_deal_terms_live, insider clusters, buybacks). Explicit like the thesis
@@ -395,6 +420,43 @@ try {
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
+
+    # -- PAPER PORTFOLIO -- books pending decisions, marks, reviews, post-mortems --
+    # HERE rather than on its own clock. It must run AFTER selection_rollup
+    # (daily_review.py reads selection_daily) and after the gold load, and
+    # guessing a time is exactly what produced the 2026-07-29 thin day folder:
+    # the update fired before the session was in the DB, logged
+    # "! fill session ... not in DB yet -- deferring", skipped the mark, and
+    # left a folder containing nothing but signals.md.
+    #
+    # BEST-EFFORT, like stages 17-18, and that is deliberate. daily_update.py
+    # now exits 1 when decisions.csv fails its shape check -- a real and useful
+    # refusal, but a PAPER-LEDGER problem. Routing it through Invoke-Stage would
+    # add it to $Failures, flip the completion sentinel to FAILURES, and through
+    # that stop the next quant-briefing from being built. The lakehouse's health
+    # and the paper book's ledger are different things; neither should gate the
+    # other. Failures are logged loudly here and in days\<session>\run.log.
+    #
+    # Via the .bat, not python directly: it already sets QV_PORTFOLIO_DATA and
+    # cd's, and it appends to daily_update.log -- which until now held a single
+    # line, because nothing ever called it. Idempotent: an already-marked
+    # session is skipped, so a re-run or a double fire costs nothing.
+    #
+    # Prod only -- the book exists once and there is no test paper portfolio.
+    if ($Env -eq 'prod') {
+        $PortfolioBat = 'D:\quantvector\claude_briefing\portfolio\run_daily_update.bat'
+        Write-Log '-- portfolio daily_update --'
+        try {
+            & $PortfolioBat 2>&1 | Tee-Object -FilePath $LogFile -Append
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "portfolio daily_update: exit $LASTEXITCODE -- see days\<session>\run.log (ledger shape check?)" 'ERROR'
+            } else {
+                Write-Log 'portfolio daily_update: OK'
+            }
+        } catch {
+            Write-Log "portfolio daily_update skipped: $($_.Exception.Message)" 'WARN'
+        }
+    }
 }
 finally { Pop-Location }
 
