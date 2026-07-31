@@ -98,6 +98,11 @@
 #>
 [CmdletBinding()]
 param(
+    # 🚨 ValidateSet, not a free string. Every SQL stage picks its database from
+    # this value, so a typo used to be the difference between "ran nothing" and
+    # "wrote to prod". `-Env prd` must fail at the parameter binder, loudly,
+    # rather than fall through a default.
+    [ValidateSet('prod', 'test')]
     [string]$Env = 'prod',
     [switch]$SkipDownload,
     [switch]$SkipScorers,
@@ -118,6 +123,17 @@ $SqlDir      = Join-Path $Repo 'maintenance_scripts_sql'
 $Lakehouse   = 'D:\quantvector\lakehouse'
 $LogDir      = Join-Path $Lakehouse 'logs'
 $PgContainer = 'quantvector-db'
+# 🚨 The DATABASE follows -Env; the CONTAINER does not. One Postgres instance
+# serves both databases, so the container name is genuinely constant while the
+# database is not.
+#
+# Until 2026-07-31 every psql call here hardcoded `-d quantvector`, so
+# `-Env test` sent the Rust stages at the test lakehouse (they honour --env)
+# while every SQL stage — selection_rollup, sec_filing_signals_rollup and the
+# holiday guard that decides whether the run happens at all — read and WROTE
+# PROD. A run believed to be a rehearsal would have silently rewritten the live
+# selection snapshot. Never reintroduce a literal database name below; use this.
+$PgDatabase  = if ($Env -eq 'test') { 'quantvector_test' } else { 'quantvector' }
 $ServerUrl   = 'http://localhost:3000'   # web server, for the post-run cache refresh
 
 $DownloaderExe  = Join-Path $BinDir 'downloader.exe'
@@ -169,7 +185,7 @@ function Invoke-Sql {
         return
     }
     try {
-        $psqlArgs = @('exec', '-i', $PgContainer, 'psql', '-U', 'quantvector', '-d', 'quantvector')
+        $psqlArgs = @('exec', '-i', $PgContainer, 'psql', '-U', 'quantvector', '-d', $PgDatabase)
         if ($StopOnError) { $psqlArgs += @('-v', 'ON_ERROR_STOP=1') }
         Get-Content $SqlFile -Raw | docker @psqlArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
         if ($LASTEXITCODE -ne 0) { throw "$Name exited $LASTEXITCODE" }
@@ -203,7 +219,7 @@ function Invoke-Py {
     }
 }
 
-Write-Log ("QuantVector nightly pipeline start (env={0})" -f $Env)
+Write-Log ("QuantVector nightly pipeline start (env={0}, db={1})" -f $Env, $PgDatabase)
 Write-Log ("log file: {0}" -f $LogFile)
 
 # Ensure the PG container is up (idempotent — no-op if already running). The
@@ -223,7 +239,7 @@ try {
 if (-not $Force) {
     $session = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
     $q = "SELECT is_trading_day, coalesce(holiday_name,'') FROM trading_calendar WHERE venue='XNYS' AND calendar_date = DATE '$session';"
-    $row = docker exec $PgContainer psql -U quantvector -d quantvector -tA -F '|' -c $q 2>&1 |
+    $row = docker exec $PgContainer psql -U quantvector -d $PgDatabase -tA -F '|' -c $q 2>&1 |
            Where-Object { $_ -match '\S' } | Select-Object -First 1
     if (-not $row) {
         Write-Log "trading_calendar has no XNYS row for prior session $session — proceeding (extend the calendar)" 'WARN'
