@@ -74,7 +74,8 @@
      17. POST /api/gold/refresh-cache                     (best-effort UI snapshot refresh)
 
   ALL stdout+stderr from every stage is tee'd into a single timestamped log
-  under $LogDir (D:\quantvector\lakehouse\logs). Nothing is discarded.
+  under $LogDir (D:\quantvector\lakehouse\logs, or lakehouse-test\logs under
+  -Env test). Nothing is discarded.
 
 .PARAMETER Env
   Environment passed to each Rust binary (default 'prod'). The script also
@@ -120,7 +121,14 @@ $ErrorActionPreference = 'Stop'
 $Repo        = 'D:\git\QuantVector'
 $BinDir      = Join-Path $Repo 'dist\target\release-fast'
 $SqlDir      = Join-Path $Repo 'maintenance_scripts_sql'
-$Lakehouse   = 'D:\quantvector\lakehouse'
+# 🚨 Follows -Env, same reason as $PgDatabase below. This is not only about
+# where logs land: line ~500 writes `.pipeline-complete.json` here, and while
+# this path was hardcoded a `-Env test` run stamped the PROD completion
+# sentinel — so anything reading it would have believed the live pipeline had
+# finished when only a rehearsal had. The two env trees are siblings by
+# convention (`lakehouse` / `lakehouse-test`), matching the config layout the
+# Rust binaries resolve from --env.
+$Lakehouse   = if ($Env -eq 'test') { 'D:\quantvector\lakehouse-test' } else { 'D:\quantvector\lakehouse' }
 $LogDir      = Join-Path $Lakehouse 'logs'
 $PgContainer = 'quantvector-db'
 # 🚨 The DATABASE follows -Env; the CONTAINER does not. One Postgres instance
