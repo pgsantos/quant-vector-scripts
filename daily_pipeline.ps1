@@ -68,6 +68,10 @@
                                                           feeds it, and it rewrites every
                                                           prior month as horizons mature)
     SELECTION ("Today's Longs")
+     15b. thesis_assembler calculate                      (explicit; AFTER selection_rollup —
+                                                           stamps the verification block —
+                                                           merges the 3 funnels into
+                                                           thesis_candidates for briefing §3b)
      16. selection_rollup.sql                             (needs crv2 + regime +
                                                           realized_volatility fresh)
     CACHE
@@ -444,6 +448,19 @@ try {
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
+
+    # ── THESIS ASSEMBLER (Phase 4, SPEC-phase4-thesis-assembler.md) ─────────────
+    # 15b. Merges the three funnels (special_situations, capital_cycle_name,
+    # theme_bottleneck) into thesis_candidates — the briefing §3b hand-off.
+    # Explicit like 14b/15: no pub/sub event feeds it (PG sources the ledger
+    # does not track). Position is load-bearing on BOTH sides: AFTER
+    # selection_rollup because every candidate is stamped with the selection
+    # verification block (quant_verdict), and BEFORE the paper portfolio
+    # because daily_review is its next consumer. Refuses (exit 1) if the
+    # special_situations anchor is stale — an assembler on yesterday's
+    # situations republishes dead forced-flow windows; slower feeds carry
+    # forward under the per-feed windows in gold-calculator.yaml.
+    Invoke-Stage 'thesis_assembler calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'thesis_assembler', '--instrument', 'stock')
 
     # -- PAPER PORTFOLIO -- books pending decisions, marks, reviews, post-mortems --
     # HERE rather than on its own clock. It must run AFTER selection_rollup
