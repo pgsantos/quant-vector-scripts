@@ -64,6 +64,10 @@
                                                            reads daily_returns, so AFTER 14)
      14b. special_situations calculate                    (explicit; feeds the thesis log's
                                                            special_situations funnel)
+     14c. theme_map calculate                             (explicit; Funnel 3, emits BOTH
+                                                           theme_membership + theme_bottleneck;
+                                                           activated 2026-08-05 once task #21
+                                                           cleared)
      15. thesis_event_outcomes calculate                  (explicit + unfiltered: no event
                                                           feeds it, and it rewrites every
                                                           prior month as horizons mature)
@@ -431,6 +435,28 @@ try {
     # funnel='special_situations'. Refuses to run if the live view's staleness
     # constant drifts from config (pg_get_viewdef pin).
     Invoke-Stage 'special_situations calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'special_situations', '--instrument', 'stock')
+
+    # ── THEME MAPPER (PHASE 3 ACTIVATION, 2026-08-05) ───────────────────────────
+    # 14c. Funnel 3. Explicit like 14b/15 — `theme_map` is explicit_only (every
+    # source is a PG table the ledger does not track), so no event ever claims
+    # it and it appears in resume's phase list without ever being scheduled.
+    # That is why Phase 3 sat built-but-dormant: nothing was wrong, nothing was
+    # running it.
+    #
+    # Activation was gated on task #21 (correlation_matrix), closed 2026-08-04.
+    #
+    # 🚨 Emits BOTH datasets from ONE run (theme_membership + theme_bottleneck).
+    # The spec (§1.4) wanted membership weekly and bottleneck nightly; the
+    # calculator cannot split them, so both refresh nightly. A stale-membership
+    # day is indistinguishable from a fresh one — ETF holdings only move on the
+    # vendor's own cadence — so daily is the honest shape, not a compromise.
+    #
+    # POSITION IS LOAD-BEARING IN BOTH DIRECTIONS: after the gold resume (its
+    # dependencies fundamental_features + universe_eligibility complete there)
+    # and BEFORE stage 15 — thesis_event_outcomes ingests theme_bottleneck as
+    # funnel='theme_bottleneck', and 15b's assembler reads it as a third funnel.
+    # Running it after either would feed them yesterday's themes.
+    Invoke-Stage 'theme_map calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'theme_map', '--instrument', 'stock')
 
     # ── THESIS OUTCOME LOG (upstream thesis, SPEC-thesis-event-outcomes) ────────
     # Explicit and UNFILTERED, deliberately — this cannot ride resume/calculate
