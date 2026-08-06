@@ -549,14 +549,74 @@ try {
 # failure here must NOT fail the pipeline.
 try {
     $sentinelPath = Join-Path $Lakehouse '.pipeline-complete.json'
+
+    # ── gold_gap_sessions ────────────────────────────────────────────────────
+    # How many trading sessions gold is behind the market, measured by the
+    # gold-calculator against trading_calendar + ingested bellwether bars and
+    # dropped in `.gold-freshness.json`.
+    #
+    # 🚨 READ, never recompute. The old in-calculator check measured staleness
+    # by counting rows in `daily_returns` -- a gold table written by the run
+    # being verified -- so it read zero exactly when the pipeline was behind and
+    # reported `status: OK` over a two-day-old universe on 2026-08-05. The rule
+    # now has one implementation; a second query here would be free to drift
+    # from it and would relearn the same lesson.
+    #
+    # $null (not 0) when the file is missing or unreadable: "not measured" and
+    # "no lag" are different facts, and a consumer must be able to tell them
+    # apart. Reporting 0 here would rebuild the very blindness this fixes.
+    $goldGap = $null
+    $goldFreshness = $null
+    try {
+        $freshnessPath = Join-Path $Lakehouse '.gold-freshness.json'
+        if (Test-Path $freshnessPath) {
+            $f = Get-Content $freshnessPath -Raw | ConvertFrom-Json
+            $goldGap = $f.gold_gap_sessions
+            $goldFreshness = $f.scopes
+            if ($goldGap -gt 0) {
+                Write-Log ("gold is {0} session(s) behind the market" -f $goldGap) 'WARN'
+            }
+        } else {
+            Write-Log 'gold freshness file absent - gold_gap_sessions reported as null' 'WARN'
+        }
+    } catch {
+        Write-Log "gold freshness read skipped: $($_.Exception.Message)" 'WARN'
+    }
+
+    # ── status ───────────────────────────────────────────────────────────────
+    # THREE values, not two (Cowork ruling 2026-08-06):
+    #   FAILURES - a stage failed
+    #   STALE    - every stage succeeded but gold is behind the market
+    #   OK       - succeeded AND current
+    #
+    # 🚨 A consumer asking "can I trust this run?" reads ONE field. With only
+    # OK/FAILURES, a run that succeeded over a two-session-old universe answers
+    # "OK" and is only corrected if the consumer also knows to read
+    # gold_gap_sessions - which is the same trust-it-has-not-earned problem the
+    # freshness check was written to fix, moved one layer up.
+    #
+    # This is NOT a re-tune: the bail threshold, the comparison and the
+    # tolerance are all untouched in the calculator. It only stops a
+    # within-tolerance lag from presenting as clean. A gap beyond tolerance
+    # never reaches here - the calculator refuses and the stage fails.
+    #
+    # $null gap means NOT MEASURED, which must not read as OK either.
+    $status = if ($script:Failures.Count) { 'FAILURES' }
+              elseif ($null -eq $goldGap)  { 'UNKNOWN' }
+              elseif ($goldGap -gt 0)      { 'STALE' }
+              else                         { 'OK' }
+
     [pscustomobject]@{
-        completed_utc = (Get-Date).ToUniversalTime().ToString('o')
-        status        = if ($script:Failures.Count) { 'FAILURES' } else { 'OK' }
-        failures      = @($script:Failures)
-        log_file      = $LogFile
-        run_stamp     = $stamp
-    } | ConvertTo-Json -Depth 4 | Set-Content -Path $sentinelPath -Encoding UTF8
-    Write-Log ("completion sentinel written: {0}" -f $sentinelPath)
+        completed_utc      = (Get-Date).ToUniversalTime().ToString('o')
+        status             = $status
+        failures           = @($script:Failures)
+        gold_gap_sessions  = $goldGap
+        gold_freshness     = $goldFreshness
+        log_file           = $LogFile
+        run_stamp          = $stamp
+    } | ConvertTo-Json -Depth 5 | Set-Content -Path $sentinelPath -Encoding UTF8
+    Write-Log ("completion sentinel written: {0} (status={1} gold_gap_sessions={2})" -f `
+        $sentinelPath, $status, $(if ($null -eq $goldGap) { 'null' } else { $goldGap }))
 } catch {
     Write-Log "sentinel write skipped: $($_.Exception.Message)" 'WARN'
 }
