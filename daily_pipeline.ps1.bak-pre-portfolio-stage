@@ -59,31 +59,19 @@
           options_vol_metrics is revived off the options silver landed above)
      14. gold-calculator resume --all                     (the binary sets its own 256 MB
                                                           stack, no env var needed)
-     14a. refresh_symbols_first_bar_date.sql              (symbols.first_bar_date for names
-                                                           that just gained a first bar;
-                                                           reads daily_returns, so AFTER 14)
      14b. special_situations calculate                    (explicit; feeds the thesis log's
                                                            special_situations funnel)
-     14c. theme_map calculate                             (explicit; Funnel 3, emits BOTH
-                                                           theme_membership + theme_bottleneck;
-                                                           activated 2026-08-05 once task #21
-                                                           cleared)
      15. thesis_event_outcomes calculate                  (explicit + unfiltered: no event
                                                           feeds it, and it rewrites every
                                                           prior month as horizons mature)
     SELECTION ("Today's Longs")
-     15b. thesis_assembler calculate                      (explicit; AFTER selection_rollup —
-                                                           stamps the verification block —
-                                                           merges the 3 funnels into
-                                                           thesis_candidates for briefing §3b)
      16. selection_rollup.sql                             (needs crv2 + regime +
                                                           realized_volatility fresh)
     CACHE
      17. POST /api/gold/refresh-cache                     (best-effort UI snapshot refresh)
 
   ALL stdout+stderr from every stage is tee'd into a single timestamped log
-  under $LogDir (D:\quantvector\lakehouse\logs, or lakehouse-test\logs under
-  -Env test). Nothing is discarded.
+  under $LogDir (D:\quantvector\lakehouse\logs). Nothing is discarded.
 
 .PARAMETER Env
   Environment passed to each Rust binary (default 'prod'). The script also
@@ -107,11 +95,6 @@
 #>
 [CmdletBinding()]
 param(
-    # 🚨 ValidateSet, not a free string. Every SQL stage picks its database from
-    # this value, so a typo used to be the difference between "ran nothing" and
-    # "wrote to prod". `-Env prd` must fail at the parameter binder, loudly,
-    # rather than fall through a default.
-    [ValidateSet('prod', 'test')]
     [string]$Env = 'prod',
     [switch]$SkipDownload,
     [switch]$SkipScorers,
@@ -129,27 +112,9 @@ $ErrorActionPreference = 'Stop'
 $Repo        = 'D:\git\QuantVector'
 $BinDir      = Join-Path $Repo 'dist\target\release-fast'
 $SqlDir      = Join-Path $Repo 'maintenance_scripts_sql'
-# 🚨 Follows -Env, same reason as $PgDatabase below. This is not only about
-# where logs land: line ~500 writes `.pipeline-complete.json` here, and while
-# this path was hardcoded a `-Env test` run stamped the PROD completion
-# sentinel — so anything reading it would have believed the live pipeline had
-# finished when only a rehearsal had. The two env trees are siblings by
-# convention (`lakehouse` / `lakehouse-test`), matching the config layout the
-# Rust binaries resolve from --env.
-$Lakehouse   = if ($Env -eq 'test') { 'D:\quantvector\lakehouse-test' } else { 'D:\quantvector\lakehouse' }
+$Lakehouse   = 'D:\quantvector\lakehouse'
 $LogDir      = Join-Path $Lakehouse 'logs'
 $PgContainer = 'quantvector-db'
-# 🚨 The DATABASE follows -Env; the CONTAINER does not. One Postgres instance
-# serves both databases, so the container name is genuinely constant while the
-# database is not.
-#
-# Until 2026-07-31 every psql call here hardcoded `-d quantvector`, so
-# `-Env test` sent the Rust stages at the test lakehouse (they honour --env)
-# while every SQL stage — selection_rollup, sec_filing_signals_rollup and the
-# holiday guard that decides whether the run happens at all — read and WROTE
-# PROD. A run believed to be a rehearsal would have silently rewritten the live
-# selection snapshot. Never reintroduce a literal database name below; use this.
-$PgDatabase  = if ($Env -eq 'test') { 'quantvector_test' } else { 'quantvector' }
 $ServerUrl   = 'http://localhost:3000'   # web server, for the post-run cache refresh
 
 $DownloaderExe  = Join-Path $BinDir 'downloader.exe'
@@ -201,7 +166,7 @@ function Invoke-Sql {
         return
     }
     try {
-        $psqlArgs = @('exec', '-i', $PgContainer, 'psql', '-U', 'quantvector', '-d', $PgDatabase)
+        $psqlArgs = @('exec', '-i', $PgContainer, 'psql', '-U', 'quantvector', '-d', 'quantvector')
         if ($StopOnError) { $psqlArgs += @('-v', 'ON_ERROR_STOP=1') }
         Get-Content $SqlFile -Raw | docker @psqlArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
         if ($LASTEXITCODE -ne 0) { throw "$Name exited $LASTEXITCODE" }
@@ -235,7 +200,7 @@ function Invoke-Py {
     }
 }
 
-Write-Log ("QuantVector nightly pipeline start (env={0}, db={1})" -f $Env, $PgDatabase)
+Write-Log ("QuantVector nightly pipeline start (env={0})" -f $Env)
 Write-Log ("log file: {0}" -f $LogFile)
 
 # Ensure the PG container is up (idempotent — no-op if already running). The
@@ -255,7 +220,7 @@ try {
 if (-not $Force) {
     $session = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
     $q = "SELECT is_trading_day, coalesce(holiday_name,'') FROM trading_calendar WHERE venue='XNYS' AND calendar_date = DATE '$session';"
-    $row = docker exec $PgContainer psql -U quantvector -d $PgDatabase -tA -F '|' -c $q 2>&1 |
+    $row = docker exec $PgContainer psql -U quantvector -d quantvector -tA -F '|' -c $q 2>&1 |
            Where-Object { $_ -match '\S' } | Select-Object -First 1
     if (-not $row) {
         Write-Log "trading_calendar has no XNYS row for prior session $session — proceeding (extend the calendar)" 'WARN'
@@ -403,28 +368,6 @@ try {
     # made for, which is exactly what happened.
     Invoke-Stage 'gold-calculator resume --all' $GoldExe @('--env', $Env, 'resume', '--all')
 
-    # ── symbols.first_bar_date (2026-07-31) ─────────────────────────────────────
-    # The pipeline's OWN earliest observed bar per (instrument, symbol) — the
-    # only listing-date leg not sourced from EODHD, and so the only one that can
-    # contradict `ipo_calendar` and `company_profiles.ipo_date` when they agree
-    # with each other and are both wrong.
-    #
-    # AFTER stage 14: it reads daily_returns, so a name that first traded today
-    # needs today's gold to have landed. Seeded once by
-    # migrations/2026-07-31b_listing_provenance.sql (2m48s, 33,340 rows); this
-    # only fills names that have gained a first bar since.
-    #
-    # 🚨 -StopOnError deliberately. Without ON_ERROR_STOP psql can exit 0 with a
-    # failed statement, and this stage would report OK forever while
-    # first_bar_date silently froze — the wired-but-blind shape (DQ-17).
-    #
-    # Bounded by design, and the obvious formulations are NOT: the seed's full
-    # GROUP BY costs 168s per run even when it updates nothing, and a
-    # per-symbol probe over NULL rows costs 52s because 49,662 symbols have no
-    # bars at all and get re-probed nightly forever. The shipped form filters on
-    # trade_date first (chunk exclusion) and measures 0.14s on prod.
-    Invoke-Sql 'refresh symbols.first_bar_date' (Join-Path $SqlDir 'refresh_symbols_first_bar_date.sql') -StopOnError
-
     # ── SPECIAL SITUATIONS (PHASE2 §21-§24) ─────────────────────────────────────
     # Daily snapshot of structural triggers (spinoffs, live M&A targets from
     # ma_deal_terms_live, insider clusters, buybacks). Explicit like the thesis
@@ -435,28 +378,6 @@ try {
     # funnel='special_situations'. Refuses to run if the live view's staleness
     # constant drifts from config (pg_get_viewdef pin).
     Invoke-Stage 'special_situations calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'special_situations', '--instrument', 'stock')
-
-    # ── THEME MAPPER (PHASE 3 ACTIVATION, 2026-08-05) ───────────────────────────
-    # 14c. Funnel 3. Explicit like 14b/15 — `theme_map` is explicit_only (every
-    # source is a PG table the ledger does not track), so no event ever claims
-    # it and it appears in resume's phase list without ever being scheduled.
-    # That is why Phase 3 sat built-but-dormant: nothing was wrong, nothing was
-    # running it.
-    #
-    # Activation was gated on task #21 (correlation_matrix), closed 2026-08-04.
-    #
-    # 🚨 Emits BOTH datasets from ONE run (theme_membership + theme_bottleneck).
-    # The spec (§1.4) wanted membership weekly and bottleneck nightly; the
-    # calculator cannot split them, so both refresh nightly. A stale-membership
-    # day is indistinguishable from a fresh one — ETF holdings only move on the
-    # vendor's own cadence — so daily is the honest shape, not a compromise.
-    #
-    # POSITION IS LOAD-BEARING IN BOTH DIRECTIONS: after the gold resume (its
-    # dependencies fundamental_features + universe_eligibility complete there)
-    # and BEFORE stage 15 — thesis_event_outcomes ingests theme_bottleneck as
-    # funnel='theme_bottleneck', and 15b's assembler reads it as a third funnel.
-    # Running it after either would feed them yesterday's themes.
-    Invoke-Stage 'theme_map calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'theme_map', '--instrument', 'stock')
 
     # ── THESIS OUTCOME LOG (upstream thesis, SPEC-thesis-event-outcomes) ────────
     # Explicit and UNFILTERED, deliberately — this cannot ride resume/calculate
@@ -474,100 +395,6 @@ try {
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
     Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
-
-    # ── THESIS ASSEMBLER (Phase 4, SPEC-phase4-thesis-assembler.md) ─────────────
-    # 15b. Merges the three funnels (special_situations, capital_cycle_name,
-    # theme_bottleneck) into thesis_candidates — the briefing §3b hand-off.
-    # Explicit like 14b/15: no pub/sub event feeds it (PG sources the ledger
-    # does not track). Position is load-bearing on BOTH sides: AFTER
-    # selection_rollup because every candidate is stamped with the selection
-    # verification block (quant_verdict), and BEFORE the paper portfolio
-    # because daily_review is its next consumer. Refuses (exit 1) if the
-    # special_situations anchor is stale — an assembler on yesterday's
-    # situations republishes dead forced-flow windows; slower feeds carry
-    # forward under the per-feed windows in gold-calculator.yaml.
-    Invoke-Stage 'thesis_assembler calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'thesis_assembler', '--instrument', 'stock')
-
-    # -- PAPER PORTFOLIO -- books pending decisions, marks, reviews, post-mortems --
-    # HERE rather than on its own clock. It must run AFTER selection_rollup
-    # (daily_review.py reads selection_daily) and after the gold load, and
-    # guessing a time is exactly what produced the 2026-07-29 thin day folder:
-    # the update fired before the session was in the DB, logged
-    # "! fill session ... not in DB yet -- deferring", skipped the mark, and
-    # left a folder containing nothing but signals.md.
-    #
-    # BEST-EFFORT, like stages 17-18, and that is deliberate. daily_update.py
-    # now exits 1 when decisions.csv fails its shape check -- a real and useful
-    # refusal, but a PAPER-LEDGER problem. Routing it through Invoke-Stage would
-    # add it to $Failures, flip the completion sentinel to FAILURES, and through
-    # that stop the next quant-briefing from being built. The lakehouse's health
-    # and the paper book's ledger are different things; neither should gate the
-    # other. Failures are logged loudly here and in days\<session>\run.log.
-    #
-    # Via the .bat, not python directly: it already sets QV_PORTFOLIO_DATA and
-    # cd's, and it appends to daily_update.log -- which until now held a single
-    # line, because nothing ever called it. Idempotent: an already-marked
-    # session is skipped, so a re-run or a double fire costs nothing.
-    #
-    # Prod only -- the book exists once and there is no test paper portfolio.
-    if ($Env -eq 'prod') {
-        $PortfolioBat = 'D:\quantvector\claude_briefing\portfolio\run_daily_update.bat'
-        Write-Log '-- portfolio daily_update --'
-        try {
-            & $PortfolioBat 2>&1 | Tee-Object -FilePath $LogFile -Append
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "portfolio daily_update: exit $LASTEXITCODE -- see days\<session>\run.log (ledger shape check?)" 'ERROR'
-            } else {
-                Write-Log 'portfolio daily_update: OK'
-            }
-        } catch {
-            Write-Log "portfolio daily_update skipped: $($_.Exception.Message)" 'WARN'
-        }
-    }
-
-    # -- BASE-RATE AUDIT -- regenerates the table the briefing's section 4 quotes --
-    # BRIEFING_RULES section 4.4 says "regenerate, never retype", and until
-    # 2026-08-07 nothing regenerated it: the briefing cited a dated markdown
-    # artifact because scripts/base_rate_audit.py needed Python >= 3.12 for one
-    # f-string and the briefing sandbox has 3.10. That line is fixed, so the only
-    # thing missing was a producer. This is it.
-    #
-    # NOT via Invoke-Py, deliberately. Invoke-Py appends to $script:Failures, which
-    # flips the Stage 18 sentinel to FAILURES, which stops the NEXT MORNING'S
-    # BRIEFING FROM BEING BUILT AT ALL. That trade is wrong here: this artifact is
-    # annotation-tier, and a stale base-rate table should degrade section 4 to a
-    # loud caveat, never suppress the whole briefing. Same reasoning the portfolio
-    # block above records for itself. (Note Invoke-Py's own comment claims it
-    # "NEVER blocks the pipeline" while adding to $Failures -- worth reconciling,
-    # but not from here.)
-    #
-    # --check 3.2 only: that is the effective-N / cluster-robust table section 4
-    # publishes. The full nine-check audit takes far longer and its other verdicts
-    # are documentation questions, not daily inputs.
-    $BaseRateJson = 'D:\quantvector\claude_briefing\base-rates-latest.json'
-    Write-Log '-- base_rate_audit (section 3.2) --'
-    try {
-        $py = Get-Command py -ErrorAction SilentlyContinue
-        if (-not $py) {
-            Write-Log 'base_rate_audit skipped: py launcher not on PATH' 'WARN'
-        } else {
-            & $py.Source -3.13 'scripts/base_rate_audit.py' '--check' '3.2' `
-                '--json' $BaseRateJson 2>&1 | Tee-Object -FilePath $LogFile -Append
-            # Exit code is NOT the health signal here. The audit exits 0 while
-            # reporting FAIL verdicts -- that is its job, and section 3.2 currently
-            # FAILs by design because the PUBLISHED table upstream still carries no
-            # effective N. What matters to the briefing is only whether the artifact
-            # was written, so that is what gets checked and logged.
-            if (Test-Path $BaseRateJson) {
-                $age = (Get-Item $BaseRateJson).LastWriteTime
-                Write-Log ("base_rate_audit: OK -> {0} (written {1:yyyy-MM-dd HH:mm})" -f $BaseRateJson, $age)
-            } else {
-                Write-Log "base_rate_audit: ran but wrote no artifact -- section 4 will caveat" 'WARN'
-            }
-        }
-    } catch {
-        Write-Log "base_rate_audit skipped: $($_.Exception.Message)" 'WARN'
-    }
 }
 finally { Pop-Location }
 
@@ -593,74 +420,14 @@ try {
 # failure here must NOT fail the pipeline.
 try {
     $sentinelPath = Join-Path $Lakehouse '.pipeline-complete.json'
-
-    # ── gold_gap_sessions ────────────────────────────────────────────────────
-    # How many trading sessions gold is behind the market, measured by the
-    # gold-calculator against trading_calendar + ingested bellwether bars and
-    # dropped in `.gold-freshness.json`.
-    #
-    # 🚨 READ, never recompute. The old in-calculator check measured staleness
-    # by counting rows in `daily_returns` -- a gold table written by the run
-    # being verified -- so it read zero exactly when the pipeline was behind and
-    # reported `status: OK` over a two-day-old universe on 2026-08-05. The rule
-    # now has one implementation; a second query here would be free to drift
-    # from it and would relearn the same lesson.
-    #
-    # $null (not 0) when the file is missing or unreadable: "not measured" and
-    # "no lag" are different facts, and a consumer must be able to tell them
-    # apart. Reporting 0 here would rebuild the very blindness this fixes.
-    $goldGap = $null
-    $goldFreshness = $null
-    try {
-        $freshnessPath = Join-Path $Lakehouse '.gold-freshness.json'
-        if (Test-Path $freshnessPath) {
-            $f = Get-Content $freshnessPath -Raw | ConvertFrom-Json
-            $goldGap = $f.gold_gap_sessions
-            $goldFreshness = $f.scopes
-            if ($goldGap -gt 0) {
-                Write-Log ("gold is {0} session(s) behind the market" -f $goldGap) 'WARN'
-            }
-        } else {
-            Write-Log 'gold freshness file absent - gold_gap_sessions reported as null' 'WARN'
-        }
-    } catch {
-        Write-Log "gold freshness read skipped: $($_.Exception.Message)" 'WARN'
-    }
-
-    # ── status ───────────────────────────────────────────────────────────────
-    # THREE values, not two (Cowork ruling 2026-08-06):
-    #   FAILURES - a stage failed
-    #   STALE    - every stage succeeded but gold is behind the market
-    #   OK       - succeeded AND current
-    #
-    # 🚨 A consumer asking "can I trust this run?" reads ONE field. With only
-    # OK/FAILURES, a run that succeeded over a two-session-old universe answers
-    # "OK" and is only corrected if the consumer also knows to read
-    # gold_gap_sessions - which is the same trust-it-has-not-earned problem the
-    # freshness check was written to fix, moved one layer up.
-    #
-    # This is NOT a re-tune: the bail threshold, the comparison and the
-    # tolerance are all untouched in the calculator. It only stops a
-    # within-tolerance lag from presenting as clean. A gap beyond tolerance
-    # never reaches here - the calculator refuses and the stage fails.
-    #
-    # $null gap means NOT MEASURED, which must not read as OK either.
-    $status = if ($script:Failures.Count) { 'FAILURES' }
-              elseif ($null -eq $goldGap)  { 'UNKNOWN' }
-              elseif ($goldGap -gt 0)      { 'STALE' }
-              else                         { 'OK' }
-
     [pscustomobject]@{
-        completed_utc      = (Get-Date).ToUniversalTime().ToString('o')
-        status             = $status
-        failures           = @($script:Failures)
-        gold_gap_sessions  = $goldGap
-        gold_freshness     = $goldFreshness
-        log_file           = $LogFile
-        run_stamp          = $stamp
-    } | ConvertTo-Json -Depth 5 | Set-Content -Path $sentinelPath -Encoding UTF8
-    Write-Log ("completion sentinel written: {0} (status={1} gold_gap_sessions={2})" -f `
-        $sentinelPath, $status, $(if ($null -eq $goldGap) { 'null' } else { $goldGap }))
+        completed_utc = (Get-Date).ToUniversalTime().ToString('o')
+        status        = if ($script:Failures.Count) { 'FAILURES' } else { 'OK' }
+        failures      = @($script:Failures)
+        log_file      = $LogFile
+        run_stamp     = $stamp
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $sentinelPath -Encoding UTF8
+    Write-Log ("completion sentinel written: {0}" -f $sentinelPath)
 } catch {
     Write-Log "sentinel write skipped: $($_.Exception.Message)" 'WARN'
 }
