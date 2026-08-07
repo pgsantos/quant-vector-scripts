@@ -42,6 +42,7 @@
       8. silver-refiner resume                            (auto-resamples unadj 5min)
     METADATA PROJECTIONS (raw metadata/fundamentals/filings -> PG tables)
       9. meta-manager resume
+      9a. meta-manager ingest-form4                      (Form 4 -> insider_transactions)
      10. meta-manager sync-catalog                        (catalog -> symbols lifecycle)
      10b. meta-manager sync-corporate-actions             (delist/listing bridge; breaker-capped)
      10c. meta-manager extract-deal-terms                 (8-K M&A/spinoff facts; 10-day window)
@@ -356,6 +357,19 @@ try {
     # ── METADATA PROJECTIONS ─────────────────────────────────────────────────
     Invoke-Stage 'meta-manager resume'          $MetaExe @('--env', $Env, 'resume')
     Invoke-Stage 'meta-manager sync-catalog'    $MetaExe @('--env', $Env, 'sync-catalog')
+    # Project newly landed Form 4 filings into insider_transactions. AFTER
+    # `meta-manager resume` on purpose: that is what parses the fetched filings
+    # into sec_filings, and this reads sec_filings.raw_path.
+    #
+    # Replaces the EODHD insider feed, abandoned by the vendor — the newest
+    # transaction it ever supplied is 2026-04-24, while its as_of_date kept
+    # advancing nightly. ~500 Form 4s/day for tracked CIKs (measured on the
+    # 2026-08-06 daily index), non-derivative transactions only.
+    #
+    # Reports untracked-issuer / unreadable counts as well as rows written, so a
+    # run that scans filings and writes nothing is distinguishable from a run
+    # that had nothing to scan. Idempotent.
+    Invoke-Stage 'meta-manager ingest-form4'    $MetaExe @('--env', $Env, 'ingest-form4')
     # Bridge catalog delistings/listings into corporate_actions (Phase 2 step
     # 1b). AFTER sync-catalog on purpose: that is what stamps the derived
     # delist dates this reads. Idempotent, cheap, and the historical backfill
