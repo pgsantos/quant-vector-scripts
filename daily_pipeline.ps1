@@ -45,7 +45,7 @@
           (Form 4 -> insider_transactions is projected INSIDE #9, not a separate stage)
      10. meta-manager sync-catalog                        (catalog -> symbols lifecycle)
      10b. meta-manager sync-corporate-actions             (delist/listing bridge; breaker-capped)
-     10c. meta-manager extract-deal-terms                 (8-K M&A/spinoff facts; 10-day window)
+     10c. meta-manager extract-deal-terms                 (8-K M&A/spinoff facts; converging drain)
      11. meta-manager produce-factors                     (split/div -> read-time factors)
     SQL ROLLUP
      12. sec_filing_signals_rollup.sql                    (needs filing_events from #9)
@@ -375,8 +375,12 @@ try {
     # Extract M&A deal terms + spinoffs from newly landed 8-Ks (Phase 2 steps
     # 2+3, PHASE2 doc §18-§19). AFTER meta resume on purpose: that is what
     # lands the raw filings and classifies filing_events.items this walks.
-    # Default 10-day window; idempotent (identity-deduped both tables); the
-    # historical backfill already ran (2026-07-29, 69/98/3 rows verified).
+    # 🚨 No window. Invoked with no arguments, which IS the drain: work is
+    # selected by NOT EXISTS (a COMPLETED projection partition), so it converges
+    # to zero and stays there. The old 10-day window left 17,695 of 17,802
+    # candidates permanently outside it while this stage reported healthy counts.
+    # Idempotent (identity-deduped both tables); historical corpus drained
+    # 2026-08-08 (17,747 evaluated -> 2 new deal rows).
     # Uncertain classification = NO row; skips are named in the stage log.
     Invoke-Stage 'meta-manager extract-deal-terms' $MetaExe @('--env', $Env, 'extract-deal-terms')
     Invoke-Stage 'meta-manager produce-factors' $MetaExe @('--env', $Env, 'produce-factors')
