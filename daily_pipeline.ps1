@@ -2,16 +2,27 @@
 .SYNOPSIS
   QuantVector nightly pipeline. Runs the full vendor->raw->bronze->silver->PG->
   gold relay end-to-end and logs EVERYTHING to the lakehouse logs dir. Runs
-  unattended at 00:00 Central via the "QuantVector Daily Pipeline" scheduled
-  task, which fires Tue-Sat (so each run processes a Mon-Fri session). Skips any
-  run whose prior session was an NYSE holiday (holiday guard; -Force overrides).
+  unattended at 22:00 local via the "QuantVector Daily Pipeline" scheduled task,
+  which fires Mon-Fri.
+
+  The run DERIVES the session it is processing rather than assuming one from the
+  trigger time: the most recent session whose 16:00 ET close precedes the run
+  start, computed in Eastern time. At a 22:00 local start that is TODAY; at a
+  00:00 start it would be yesterday. Skips any run whose derived session was not
+  an XNYS trading day (weekend or holiday; -Force overrides).
 
 .DESCRIPTION
   Consolidated from the two cheat-sheet blocks (docs/cheat_sheets/
   quantvector_runs.md: NIGHTLY 7PM main pool + NIGHTLY 11PM options) into one
-  midnight run. Midnight Central is ~1h after EODHD finalizes US 5-min intraday
-  (~11PM ET) and well past the 00:00 UTC budget reset, so a single run catches
-  the current session's 5-min and spends the fresh daily budget.
+  run. 22:00 local (23:00 ET) is after EODHD finalizes US 5-min intraday
+  (~11PM ET), so a single run catches the current session's 5-min.
+
+  🚨 The 22:00 start is deliberate and the session derivation exists to serve
+  it. Between 2026-08-29 and 2026-09-06 the trigger fired at 22:00 while the
+  code still assumed a 00:00 "prior session" start — so a run downloaded TODAY's
+  session but evaluated YESTERDAY's calendar entry. Mon 2026-08-31 was never
+  fetched at all (Monday was not in the trigger set) and Tue 2026-09-08 would
+  have skipped on the Labor-Day entry for 09-07, losing the Tuesday session.
 
   Stages, in dependency order. Each is best-effort: a failure is logged and the
   script continues to the next stage, then the script exits non-zero so Task
@@ -27,13 +38,14 @@
       4. downloader download --schedule sec_daily --vendor sec         (last-7d filings)
       5. downloader download --schedule options_daily --throttle 200 --concurrency 8
       5x. downloader download --schedule capacity_weekly --vendor capacity
-          WEEKLY (Saturday). FRED monthly + EIA weekly series behind the
+          WEEKLY (see $IsWeekly). FRED monthly + EIA weekly series behind the
           capital_cycle capacity leg; nightly would re-fetch identical bytes.
       5w. downloader download --schedule rename_reconcile --vendor eodhd
-          WEEKLY (Saturday run only — post-Friday close). Full-history rename
-          pull; the only one once the nightly job carries lookback_days: 60.
-          All WEEKLY stages gate on $IsWeekly — Saturday, NOT Sunday: this
-          pipeline skips non-trading days, so Sun/Mon 00:00 never run.
+          WEEKLY (first run at/after the week's last trading day). Full-history
+          rename pull; the only one once the nightly carries lookback_days: 60.
+          All WEEKLY stages gate on $IsWeekly, which keys on the SESSION's
+          week — the first run at or after the week's last trading day — not on
+          the run's weekday. A missed Friday is caught up by the next run.
       (no blanket `downloader resume` — deliberately. Each schedule above drains
        its own throughput-sized plan; standing backfills are drained MANUALLY
        after inspecting what's pending. See the note at the stage site below.)
@@ -100,7 +112,7 @@
   to keep the run pure-Rust/SQL.
 
 .PARAMETER Force
-  Run even when the prior session was a non-trading day (bypass the holiday
+  Run even when the derived session was a non-trading day (bypass the holiday
   guard) — e.g. to process crypto/fx on an equity holiday, or to backfill.
 
 .EXAMPLE
@@ -116,11 +128,11 @@ param(
     [string]$Env = 'prod',
     [switch]$SkipDownload,
     [switch]$SkipScorers,
-    # Run even if the prior session was a non-trading day (e.g. to process the
+    # Run even if the derived session was a non-trading day (e.g. to process the
     # crypto/fx that DO trade on equity holidays, or to backfill).
     [switch]$Force,
-    # Run the WEEKLY stages regardless of weekday (they normally fire only on
-    # the Saturday 00:00 run). Use to catch up a missed week, or to test.
+    # Run the WEEKLY stages regardless of the gate (they normally fire on the
+    # first run at/after the week's last trading day). Catch-up, or to test.
     [switch]$ForceWeekly
 )
 
@@ -247,43 +259,116 @@ try {
     Write-Log "docker start $PgContainer reported: $($_.Exception.Message)" 'WARN'
 }
 
+# ─── Session under processing ─────────────────────────────────────────────
+# The run processes the most recent session whose close precedes the run start.
+#
+# 🚨 DERIVED, never assumed from the trigger time. This used to be a hardcoded
+# `(Get-Date).AddDays(-1)` written for a 00:00 trigger. The trigger moved to
+# 22:00 on 2026-08-29 and the assumption silently went a day out: a 22:00 run
+# downloads TODAY's session but the guard was still evaluating YESTERDAY. That
+# is why Tue 2026-09-08 would have skipped on the Labor-Day calendar entry and
+# lost the Tuesday session, exactly as Mon 08-31 was lost.
+#
+# 🚨 Derived in EXCHANGE time, not host-local time. The session is a property of
+# the NYSE clock, and both the host's zone and the trigger hour have moved
+# before. This host is PACIFIC, so the 22:00 local trigger fires at 01:00 ET the
+# NEXT calendar day — 9h after the 16:00 ET close, not 7h. Deriving in ET makes
+# that irrelevant: the rule is "the last close that precedes now", whatever the
+# host clock says. A local-hour rule would need the right hour per zone (13 for
+# PT, 15 for CT) and silently misfires for any run between the true close and a
+# wrong configured hour. The close is 16:00 ET year-round, so no DST branch.
+#
+# Defined UNCONDITIONALLY — a -Force run needs $session too. Only the calendar
+# CHECK below is gated on -Force.
+$EtZone = try   { [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time') }
+          catch { [TimeZoneInfo]::FindSystemTimeZoneById('America/New_York') }
+$Et = [TimeZoneInfo]::ConvertTime((Get-Date), $EtZone)
+$SessionDate = if ($Et.TimeOfDay -ge [timespan]'16:00') { $Et.Date } else { $Et.Date.AddDays(-1) }
+$session = $SessionDate.ToString('yyyy-MM-dd')
+Write-Log ("session={0} (run start {1} local / {2} ET; NYSE close 16:00 ET)" -f `
+    $session, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Et.ToString('yyyy-MM-dd HH:mm:ss'))
+
 # ─── Holiday / non-trading-day guard ──────────────────────────────────────
-# The midnight run processes the PRIOR session. If that day was not an NYSE
-# (XNYS) trading day — weekend or holiday — there is no new equity data, so skip
-# (crypto/fx, which DO trade, are picked up on the next run; use -Force to run
-# now). Source of truth = the shared `trading_calendar` table. Fail-safe: a
-# date the calendar doesn't cover does NOT skip (it warns and runs).
+# If the derived session was not an NYSE (XNYS) trading day — weekend or holiday
+# — there is no new equity data, so skip (crypto/fx, which DO trade, are picked
+# up on the next run; use -Force to run now). Source of truth = the shared
+# `trading_calendar` table. Fail-safe: a date the calendar doesn't cover does
+# NOT skip (it warns and runs).
 if (-not $Force) {
-    $session = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
     $q = "SELECT is_trading_day, coalesce(holiday_name,'') FROM trading_calendar WHERE venue='XNYS' AND calendar_date = DATE '$session';"
     $row = docker exec $PgContainer psql -U quantvector -d $PgDatabase -tA -F '|' -c $q 2>&1 |
            Where-Object { $_ -match '\S' } | Select-Object -First 1
     if (-not $row) {
-        Write-Log "trading_calendar has no XNYS row for prior session $session — proceeding (extend the calendar)" 'WARN'
+        Write-Log "trading_calendar has no XNYS row for session $session — proceeding (extend the calendar)" 'WARN'
     } elseif (($row -split '\|')[0] -eq 'f') {
         $why = ($row -split '\|')[1]; if (-not $why) { $why = 'weekend' }
-        Write-Log "prior session $session was not an XNYS trading day ($why) — skipping pipeline (use -Force to run anyway)"
+        Write-Log "session $session was not an XNYS trading day ($why) — skipping pipeline (use -Force to run anyway)"
         Write-Log 'DONE — skipped (non-trading day)'
         exit 0
     } else {
-        Write-Log "prior session $session is an XNYS trading day — proceeding"
+        Write-Log "session $session is an XNYS trading day — proceeding"
     }
 }
 
 # ─── Weekly gate ──────────────────────────────────────────────────────────
-# WEEKLY stages run on the Saturday 00:00 run — the first run after Friday's
-# close, so a full trading week is in the books.
+# WEEKLY stages run once per trading week, on the first run at or after that
+# week's LAST trading day ("the week closer" — normally Friday).
 #
-# 🚨 NOT Sunday. This pipeline processes the PRIOR session and the guard above
-# exits on a non-trading day, so Sunday 00:00 (prior session = Saturday) and
-# Monday 00:00 (prior session = Sunday) never run. The effective cadence is
-# Tue-Sat; a Sunday-gated stage would silently never fire.
-$IsWeekly = $ForceWeekly -or ((Get-Date).DayOfWeek -eq 'Saturday')
+# 🚨 KEYED ON STATE, not on a weekday. It used to be `DayOfWeek -eq 'Saturday'`,
+# which assumes the schedule fired. Once the Saturday trigger is dropped there
+# is no second chance: one missed or failed Friday run and the whole week's
+# weekly stages are skipped silently, forever. Instead we compare the week
+# closer against `last_weekly_completed_session` from the completion sentinel,
+# so a missed Friday is picked up by the NEXT run (Monday's) rather than never.
+#
+# 🚨 The closer is "the last XNYS trading day of its ISO week", read from
+# `trading_calendar` — NOT literal Friday. Good Friday is a market holiday every
+# year, and a literal-Friday rule would skip that entire week's weekly stages.
+#
+# Bootstrap: an ABSENT `last_weekly_completed_session` means "never" and the
+# weekly stages FIRE. The first run after this change reads a sentinel written
+# by the old code, which has no such field. Firing is the safe default — do not
+# "fix" this into a skip.
+$WeeklyStageNames = @('download rename_reconcile', 'download capacity_weekly')
+$weekCloser = $null
+$lastWeekly = $null
+try {
+    $qc = @"
+WITH td AS (
+    SELECT calendar_date::date AS d, date_trunc('week', calendar_date)::date AS wk
+    FROM trading_calendar WHERE venue='XNYS' AND is_trading_day
+), closers AS (
+    SELECT wk, max(d) AS d FROM td GROUP BY wk
+)
+SELECT max(d) FROM closers WHERE d <= DATE '$session';
+"@
+    $weekCloser = (docker exec $PgContainer psql -U quantvector -d $PgDatabase -tA -c $qc 2>&1 |
+                   Where-Object { $_ -match '^\d{4}-\d{2}-\d{2}$' } | Select-Object -First 1)
+} catch {
+    Write-Log "week-closer lookup failed: $($_.Exception.Message)" 'WARN'
+}
+$sentinelPathForRead = Join-Path $Lakehouse '.pipeline-complete.json'
+if (Test-Path $sentinelPathForRead) {
+    try {
+        $prev = Get-Content $sentinelPathForRead -Raw | ConvertFrom-Json
+        if ($prev.PSObject.Properties.Name -contains 'last_weekly_completed_session') {
+            $lastWeekly = $prev.last_weekly_completed_session
+        }
+    } catch {
+        Write-Log "could not read prior sentinel for the weekly gate: $($_.Exception.Message)" 'WARN'
+    }
+}
+# Fail-safe: if the closer can't be determined, do NOT fire weekly off a guess.
+$IsWeekly = $ForceWeekly -or ($weekCloser -and (-not $lastWeekly -or $lastWeekly -lt $weekCloser))
 if ($IsWeekly) {
-    $why = if ($ForceWeekly) { '-ForceWeekly' } else { 'Saturday run (post-Friday close)' }
+    $why = if ($ForceWeekly) { '-ForceWeekly' }
+           elseif (-not $lastWeekly) { "no prior weekly recorded (bootstrap); week closer $weekCloser" }
+           else { "week closer $weekCloser is newer than last weekly $lastWeekly" }
     Write-Log "weekly stages ENABLED this run — $why"
+} elseif (-not $weekCloser) {
+    Write-Log 'weekly stages skipped — could not resolve the week closer from trading_calendar' 'WARN'
 } else {
-    Write-Log "weekly stages skipped (not the Saturday run; use -ForceWeekly to override)"
+    Write-Log "weekly stages skipped (already ran for week closer $weekCloser; use -ForceWeekly to override)"
 }
 
 Push-Location $Repo   # so the apps find .env via load_env_from_ancestors
@@ -298,7 +383,7 @@ try {
         Invoke-Stage 'download sec_daily'      $DownloaderExe @('--env', $Env, 'download', '--schedule', 'sec_daily', '--vendor', 'sec')
         Invoke-Stage 'download options_daily'  $DownloaderExe @('--env', $Env, 'download', '--schedule', 'options_daily', '--throttle', '200', '--concurrency', '8')
 
-        # ── WEEKLY downloads (Saturday run only — see the weekly gate above) ──
+        # ── WEEKLY downloads (gated on $IsWeekly — see the weekly gate above) ──
         if ($IsWeekly) {
             # FULL rename reconcile: /symbol-change-history from 2000 -> today.
             # 1 API call/week, and the ONLY full-history pull once the nightly
@@ -331,7 +416,7 @@ try {
             #
             # Placed in the download phase on purpose, like rename_reconcile:
             # `meta-manager resume` (stage 9) parses the landed files in the
-            # SAME run, so a Saturday night lands data AND projects it.
+            # SAME run, so the week-closing night lands data AND projects it.
             Invoke-Stage 'download capacity_weekly' $DownloaderExe @('--env', $Env, 'download', '--schedule', 'capacity_weekly', '--vendor', 'capacity')
         }
 
@@ -622,22 +707,95 @@ try {
     # $null (not 0) when the file is missing or unreadable: "not measured" and
     # "no lag" are different facts, and a consumer must be able to tell them
     # apart. Reporting 0 here would rebuild the very blindness this fixes.
+    # ── ingest_lag_sessions ──────────────────────────────────────────────────
+    # 🚨 gold_gap_sessions ALONE IS NOT A FRESHNESS CHECK (2026-09-04).
+    # It measures gold against min(latest_session, latest_ingested), so when
+    # INGEST stalls the reference falls with it and the gap reads 0 at exactly
+    # the moment the universe is behind. On 2026-09-04 it read 0 with
+    # latest_ingested=2026-09-02 against latest_session=2026-09-04 - two
+    # completed sessions missing, because 09-03's bulk_eod files downloaded but
+    # failed to register in the ledger. This run only avoided reporting OK
+    # because an unrelated stage happened to fail.
+    #
+    # The calculator now also emits ingest_lag_sessions (uncapped) and
+    # ingest_stale. Same rule as above: READ, never recompute.
     $goldGap = $null
     $goldFreshness = $null
+    $ingestLag = $null
+    $ingestStale = $false
+    $maxIngestLag = $null
+    # Distinguishes "the calculator does not emit this yet" (an older binary)
+    # from "the calculator emitted it as null" (measured, and unknown). Only the
+    # SECOND is a reason to downgrade status - treating the first as UNKNOWN
+    # would make every night read UNKNOWN until the gold-calculator is rebuilt,
+    # which is a false alarm, and a guard that cries wolf nightly is one nobody
+    # reads. See the status expression below.
+    $ingestFieldPresent = $false
     try {
         $freshnessPath = Join-Path $Lakehouse '.gold-freshness.json'
         if (Test-Path $freshnessPath) {
             $f = Get-Content $freshnessPath -Raw | ConvertFrom-Json
             $goldGap = $f.gold_gap_sessions
             $goldFreshness = $f.scopes
+            $ingestFieldPresent = ($f.PSObject.Properties.Name -contains 'ingest_lag_sessions')
+            $ingestLag = $f.ingest_lag_sessions
+            $maxIngestLag = $f.max_ingest_lag_sessions
+            # -eq $true so a missing property (an older calculator build) reads
+            # as false rather than throwing.
+            $ingestStale = ($f.ingest_stale -eq $true)
             if ($goldGap -gt 0) {
                 Write-Log ("gold is {0} session(s) behind the market" -f $goldGap) 'WARN'
+            }
+            if ($ingestStale) {
+                Write-Log ("INGEST IS STALE: {0} session(s) behind the trading calendar (tolerance {1}). Bars for a completed session never landed - check `download daily` failures and `downloader reregister-orphans --dry-run`." -f $ingestLag, $maxIngestLag) 'ERROR'
+            } elseif (-not $ingestFieldPresent) {
+                Write-Log 'gold-calculator predates the ingest-lag measure (no ingest_lag_sessions field) - rebuild it; until then gold_gap_sessions is BLIND to an ingest stall' 'WARN'
+            } elseif ($null -eq $ingestLag) {
+                Write-Log 'ingest lag not measured - freshness is UNKNOWN, not healthy' 'WARN'
             }
         } else {
             Write-Log 'gold freshness file absent - gold_gap_sessions reported as null' 'WARN'
         }
     } catch {
         Write-Log "gold freshness read skipped: $($_.Exception.Message)" 'WARN'
+    }
+
+    # ── consecutive_failures ─────────────────────────────────────────────────
+    # 🚨 The sentinel is overwritten every run, so it has no memory. That is why
+    # `meta-manager sync-corporate-actions` could fail EIGHT nights running
+    # while each morning's file looked like a fresh single-night blip - there
+    # was nothing to compare against, and the only cross-night evidence was the
+    # per-run logs.
+    #
+    # Carry a per-stage streak forward: read the PREVIOUS sentinel before
+    # overwriting it, and for each stage failing now, increment what it carried.
+    # A stage that succeeds drops out of the map, so a streak only ever counts
+    # CONSECUTIVE nights.
+    $consecutiveFailures = @{}
+    try {
+        if (Test-Path $sentinelPath) {
+            $prev = Get-Content $sentinelPath -Raw | ConvertFrom-Json
+            $prevStreaks = @{}
+            if ($prev.PSObject.Properties.Name -contains 'consecutive_failures' -and $prev.consecutive_failures) {
+                foreach ($p in $prev.consecutive_failures.PSObject.Properties) {
+                    $prevStreaks[$p.Name] = [int]$p.Value
+                }
+            }
+            foreach ($stage in $script:Failures) {
+                $consecutiveFailures[$stage] = 1 + $(if ($prevStreaks.ContainsKey($stage)) { $prevStreaks[$stage] } else { 0 })
+            }
+        } else {
+            foreach ($stage in $script:Failures) { $consecutiveFailures[$stage] = 1 }
+        }
+    } catch {
+        Write-Log "previous sentinel unreadable, streaks restart at 1: $($_.Exception.Message)" 'WARN'
+        foreach ($stage in $script:Failures) { $consecutiveFailures[$stage] = 1 }
+    }
+    # Surface a repeat failure loudly. A stage failing two nights running is not
+    # a transient and will not fix itself.
+    $repeatFailures = @($consecutiveFailures.Keys | Where-Object { $consecutiveFailures[$_] -ge 2 })
+    foreach ($stage in $repeatFailures) {
+        Write-Log ("REPEAT FAILURE: '{0}' has now failed {1} nights running - this is not transient" -f $stage, $consecutiveFailures[$stage]) 'ERROR'
     }
 
     # ── status ───────────────────────────────────────────────────────────────
@@ -658,22 +816,59 @@ try {
     # never reaches here - the calculator refuses and the stage fails.
     #
     # $null gap means NOT MEASURED, which must not read as OK either.
+    #
+    # 🚨 ingest_stale is checked BEFORE the gold gap and outranks it. A stalled
+    # ingest presents as gold_gap_sessions = 0 (see above), so ordering it after
+    # the gap check would leave it unreachable - the exact blindness this is
+    # here to close. An unmeasurable ingest lag is UNKNOWN, never OK.
+    #
+    # The `$ingestFieldPresent -and` guard is deliberate: an older
+    # gold-calculator emits no ingest_lag_sessions at all, and downgrading every
+    # such night to UNKNOWN would be a nightly false alarm. That case is a loud
+    # WARN in the log instead (see above) and leaves status on the old rules --
+    # which means it is BLIND to an ingest stall until the calculator is
+    # rebuilt. Once the field is emitted, a null value is a real "cannot
+    # measure" and does downgrade.
     $status = if ($script:Failures.Count) { 'FAILURES' }
-              elseif ($null -eq $goldGap)  { 'UNKNOWN' }
-              elseif ($goldGap -gt 0)      { 'STALE' }
-              else                         { 'OK' }
+              elseif ($ingestStale)       { 'STALE' }
+              elseif ($null -eq $goldGap) { 'UNKNOWN' }
+              elseif ($ingestFieldPresent -and $null -eq $ingestLag) { 'UNKNOWN' }
+              elseif ($goldGap -gt 0)     { 'STALE' }
+              else                        { 'OK' }
+
+    $weeklyFailed = @($script:Failures | Where-Object { $WeeklyStageNames -contains $_ }).Count -gt 0
+    $weeklyStamp = if ($IsWeekly -and -not $weeklyFailed -and $weekCloser) { $weekCloser } else { $lastWeekly }
+    if ($IsWeekly -and $weeklyFailed) {
+        Write-Log 'weekly stages FAILED this run — not advancing last_weekly_completed_session (will retry next run)' 'WARN'
+    }
 
     [pscustomobject]@{
-        completed_utc      = (Get-Date).ToUniversalTime().ToString('o')
-        status             = $status
-        failures           = @($script:Failures)
-        gold_gap_sessions  = $goldGap
-        gold_freshness     = $goldFreshness
-        log_file           = $LogFile
-        run_stamp          = $stamp
+        completed_utc           = (Get-Date).ToUniversalTime().ToString('o')
+        status                  = $status
+        failures                = @($script:Failures)
+        # Per-stage consecutive-night streaks; a stage that succeeds drops out.
+        consecutive_failures    = $consecutiveFailures
+        # Stages failing >= 2 nights running: the "this is not transient" set.
+        repeat_failures         = @($repeatFailures)
+        gold_gap_sessions       = $goldGap
+        # 🚨 Read BOTH. gold_gap_sessions is blind to an ingest stall by
+        # construction; ingest_lag_sessions is what catches a missing session.
+        ingest_lag_sessions     = $ingestLag
+        max_ingest_lag_sessions = $maxIngestLag
+        ingest_stale            = $ingestStale
+        gold_freshness          = $goldFreshness
+        # Drives the weekly gate on the NEXT run (see "Weekly gate" above).
+        # Advanced only when this run actually ran the weekly stages AND none of
+        # them failed — a failed weekly stage must be retried next run, not
+        # marked done. Otherwise the prior value is carried forward unchanged;
+        # writing $null here would re-fire weekly every single night.
+        last_weekly_completed_session = $weeklyStamp
+        log_file                = $LogFile
+        run_stamp               = $stamp
     } | ConvertTo-Json -Depth 5 | Set-Content -Path $sentinelPath -Encoding UTF8
-    Write-Log ("completion sentinel written: {0} (status={1} gold_gap_sessions={2})" -f `
-        $sentinelPath, $status, $(if ($null -eq $goldGap) { 'null' } else { $goldGap }))
+    Write-Log ("completion sentinel written: {0} (status={1} gold_gap_sessions={2} ingest_lag_sessions={3})" -f `
+        $sentinelPath, $status, $(if ($null -eq $goldGap) { 'null' } else { $goldGap }), `
+        $(if ($null -eq $ingestLag) { 'null' } else { $ingestLag }))
 } catch {
     Write-Log "sentinel write skipped: $($_.Exception.Message)" 'WARN'
 }
