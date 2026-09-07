@@ -571,7 +571,15 @@ try {
     Invoke-Stage 'thesis_event_outcomes calculate' $GoldExe @('--env', $Env, 'calculate', '--calculator', 'thesis_event_outcomes', '--instrument', 'stock')
 
     # ── SELECTION ("Today's Longs") — needs crv2 + regime + realized_volatility ─
-    Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql')
+    # 🚨 -StopOnError (psql ON_ERROR_STOP=1) is LOAD-BEARING here, not tidiness.
+    # This file is transactional (BEGIN / DELETE / INSERT / COMMIT). Without the
+    # flag, psql continues past a failed statement and EXITS 0, so a rejected
+    # INSERT rolls the transaction back, leaves selection_daily at yesterday's
+    # date, and this stage still logs "selection_rollup: OK" — the sentinel
+    # reads healthy and the next briefing gates on stale data.
+    # Found 2026-09-07: a column-count drift between the INSERT list and the
+    # SELECT would have failed exactly this way on the Tue 09-08 run.
+    Invoke-Sql 'selection_rollup' (Join-Path $SqlDir 'selection_rollup.sql') -StopOnError
 
     # ── THESIS ASSEMBLER (Phase 4, SPEC-phase4-thesis-assembler.md) ─────────────
     # 15b. Merges the three funnels (special_situations, capital_cycle_name,
