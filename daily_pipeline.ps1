@@ -164,6 +164,15 @@ $PgContainer = 'quantvector-db'
 # selection snapshot. Never reintroduce a literal database name below; use this.
 $PgDatabase  = if ($Env -eq 'test') { 'quantvector_test' } else { 'quantvector' }
 $ServerUrl   = 'http://localhost:3000'   # web server, for the post-run cache refresh
+# Gold claim-failure report: gold-calculator `claim-failures` writes it (the
+# GOLD CLAIM-FAILURE REPORT step, last inside the Push-Location block), Stage 18
+# reads it. A ledger dataset that holds FAILED gold partitions this many nights
+# running is escalated into $Failures -- the same ">= 2 nights is not transient"
+# rule repeat_failures uses. The first night is reported in claim_failures, not
+# escalated (spec IMPLEMENTATION-SPEC-duckdb-claim-dispatch-desync section 4,
+# option C).
+$ClaimFailuresFile          = '.gold-claim-failures.json'
+$ClaimFailureEscalateNights = 2
 
 $DownloaderExe  = Join-Path $BinDir 'downloader.exe'
 $TransformerExe = Join-Path $BinDir 'transformer-v2.exe'
@@ -173,6 +182,9 @@ $GoldExe        = Join-Path $BinDir 'gold-calculator.exe'
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+# UTC start of THIS run. Stage 18 rejects any gold-calculator report written
+# before it, so a file left over from an earlier night is never read as tonight's.
+$runStartUtc = (Get-Date).ToUniversalTime()
 $LogFile = Join-Path $LogDir ("daily-pipeline-{0}.log" -f $stamp)
 $script:Failures = @()
 
@@ -180,6 +192,56 @@ function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
     $line = "{0}  [{1}]  {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
     $line | Tee-Object -FilePath $LogFile -Append
+}
+
+# ── Gold claim-failure report helpers (spec section 4, option C) ──────────────
+# Read gold-calculator's claim-failure report. Returns the parsed report, or
+# $null when it is absent, carries no timestamp, or was written before THIS run
+# started -- a file left over from an earlier night must never be read as
+# tonight's measurement. A malformed file throws; the caller reads that as not
+# measured too.
+function Read-ClaimFailureReport {
+    param([string]$Path, [datetime]$RunStartUtc)
+    if (-not (Test-Path $Path)) { return $null }
+    $report = Get-Content $Path -Raw | ConvertFrom-Json
+    if ($null -eq $report -or -not $report.written_utc) { return $null }
+    # ConvertFrom-Json already turns an ISO timestamp into [datetime]; the cast
+    # covers a plain string as well.
+    $written = ([datetime]$report.written_utc).ToUniversalTime()
+    if ($written -lt $RunStartUtc) { return $null }
+    return $report
+}
+
+# Read a name -> nights map (consecutive_failures, claim_failure_streaks) from
+# the PREVIOUS sentinel. An absent file or field reads as empty.
+function Read-SentinelStreaks {
+    param([string]$Path, [string]$Field)
+    $streaks = @{}
+    if (-not (Test-Path $Path)) { return $streaks }
+    $prev = Get-Content $Path -Raw | ConvertFrom-Json
+    if ($prev.PSObject.Properties.Name -contains $Field -and $prev.$Field) {
+        foreach ($p in $prev.$Field.PSObject.Properties) { $streaks[$p.Name] = [int]$p.Value }
+    }
+    return $streaks
+}
+
+# Carry per-dataset claim-failure streaks forward. A dataset holding FAILED
+# partitions tonight increments what it carried; one with none drops out. When
+# the report is $null (not measured) the previous streaks are carried UNCHANGED,
+# as a copy: an unmeasured night is neither a failure nor a recovery, so it can
+# neither start an escalation nor clear one.
+function Get-ClaimFailureStreaks {
+    param($Report, [hashtable]$PreviousStreaks)
+    if ($null -eq $PreviousStreaks) { $PreviousStreaks = @{} }
+    if ($null -eq $Report) { return $PreviousStreaks.Clone() }
+    $streaks = @{}
+    foreach ($d in @($Report.datasets)) {
+        # @($null) is a one-element array, so a null entry must be skipped.
+        if ($null -eq $d) { continue }
+        $carried = if ($PreviousStreaks.ContainsKey($d.dataset)) { $PreviousStreaks[$d.dataset] } else { 0 }
+        $streaks[$d.dataset] = 1 + $carried
+    }
+    return $streaks
 }
 
 # Run a pipeline binary, streaming ALL output (stdout+stderr) into the log file.
@@ -674,6 +736,36 @@ try {
     } catch {
         Write-Log "base_rate_audit skipped: $($_.Exception.Message)" 'WARN'
     }
+
+    # ── GOLD CLAIM-FAILURE REPORT (spec section 4, option C; best-effort) ───────
+    # `resume` exits 0 however many ledger claims it failed (it prints `Failed: N`
+    # and returns Ok on every path), so on 2026-09-09..11 volume_conviction failed
+    # every claim it made while this script logged "gold-calculator resume --all:
+    # OK" and the sentinel read failures: []. The ledger records each failure; the
+    # calculator reads it there and writes .gold-claim-failures.json, and Stage 18
+    # turns that into claim_failures / claim_failure_streaks.
+    #
+    # 🚨 LAST step INSIDE this Push-Location block, on purpose. The binaries find
+    # .env from their WORKING DIRECTORY (load_env_from_ancestors), and Stages
+    # 17-18 run after the Pop-Location below -- placed there, this exits 1 with
+    # "environment variable not found" every night and claim_failures reads null
+    # forever. Last, so the report sees the ledger after every gold-touching step.
+    #
+    # NOT via Invoke-Stage: a gold-calculator older than this report does not know
+    # the subcommand (exit 2), and Invoke-Stage would put that in $Failures and
+    # flip the sentinel to FAILURES on a night nothing failed. Stage 18 reads an
+    # absent or stale report as "not measured" instead.
+    try {
+        Write-Log '-- gold-calculator claim-failures --'
+        & $GoldExe --env $Env claim-failures 2>&1 | Tee-Object -FilePath $LogFile -Append
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "gold claim-failure report: exit $LASTEXITCODE -- claim failures will read as not measured (gold-calculator predates the subcommand? rebuild it)" 'WARN'
+        } else {
+            Write-Log 'gold claim-failure report: written'
+        }
+    } catch {
+        Write-Log "gold claim-failure report skipped: $($_.Exception.Message)" 'WARN'
+    }
 }
 finally { Pop-Location }
 
@@ -768,6 +860,55 @@ try {
         Write-Log "gold freshness read skipped: $($_.Exception.Message)" 'WARN'
     }
 
+    # ── claim_failures (spec section 4, option C) ────────────────────────────
+    # FAILED gold ledger partitions per dataset, as reported by the GOLD
+    # CLAIM-FAILURE REPORT step THIS run. READ, never recompute -- the same rule
+    # as the freshness file above. $null means NOT MEASURED (report absent, stale
+    # or malformed), which is not the same fact as an empty list ("measured,
+    # nothing failed").
+    #
+    # A dataset is REPORTED the first night and ESCALATED into $Failures only
+    # once it has held FAILED partitions $ClaimFailureEscalateNights nights
+    # running. That must happen here, before consecutive_failures and status are
+    # computed, so an escalated dataset flows through both exactly like a failed
+    # stage.
+    $claimFailures = $null
+    $claimFailureStreaks = @{}
+    try {
+        $prevClaimStreaks = @{}
+        try {
+            $prevClaimStreaks = Read-SentinelStreaks -Path $sentinelPath -Field 'claim_failure_streaks'
+        } catch {
+            Write-Log "previous claim-failure streaks unreadable, restarting at 0: $($_.Exception.Message)" 'WARN'
+        }
+        $report = $null
+        try {
+            $report = Read-ClaimFailureReport -Path (Join-Path $Lakehouse $ClaimFailuresFile) -RunStartUtc $runStartUtc
+        } catch {
+            Write-Log "gold claim-failure report unreadable, reported as not measured: $($_.Exception.Message)" 'WARN'
+        }
+        if ($null -eq $report) {
+            Write-Log 'gold claim-failure report absent or stale - claim_failures is null (not measured)' 'WARN'
+        } else {
+            $claimFailures = @($report.datasets | Where-Object { $null -ne $_ })
+        }
+        $claimFailureStreaks = Get-ClaimFailureStreaks -Report $report -PreviousStreaks $prevClaimStreaks
+        if ($null -ne $claimFailures) {
+            foreach ($d in $claimFailures) {
+                Write-Log ("gold claim failures: {0} holds {1} FAILED partition(s) [{2}], {3} night(s) running; latest error: {4}" -f `
+                    $d.dataset, $d.failed_partitions, ($d.instruments -join ','), $claimFailureStreaks[$d.dataset], $d.latest_error) 'WARN'
+            }
+        }
+        foreach ($ds in @($claimFailureStreaks.Keys)) {
+            if ($claimFailureStreaks[$ds] -ge $ClaimFailureEscalateNights) {
+                $script:Failures += "gold claim failures: $ds"
+                Write-Log ("ESCALATED: '{0}' has held FAILED gold partitions {1} nights running - added to failures" -f $ds, $claimFailureStreaks[$ds]) 'ERROR'
+            }
+        }
+    } catch {
+        Write-Log "claim-failure handling skipped: $($_.Exception.Message)" 'WARN'
+    }
+
     # ── consecutive_failures ─────────────────────────────────────────────────
     # 🚨 The sentinel is overwritten every run, so it has no memory. That is why
     # `meta-manager sync-corporate-actions` could fail EIGHT nights running
@@ -781,19 +922,9 @@ try {
     # CONSECUTIVE nights.
     $consecutiveFailures = @{}
     try {
-        if (Test-Path $sentinelPath) {
-            $prev = Get-Content $sentinelPath -Raw | ConvertFrom-Json
-            $prevStreaks = @{}
-            if ($prev.PSObject.Properties.Name -contains 'consecutive_failures' -and $prev.consecutive_failures) {
-                foreach ($p in $prev.consecutive_failures.PSObject.Properties) {
-                    $prevStreaks[$p.Name] = [int]$p.Value
-                }
-            }
-            foreach ($stage in $script:Failures) {
-                $consecutiveFailures[$stage] = 1 + $(if ($prevStreaks.ContainsKey($stage)) { $prevStreaks[$stage] } else { 0 })
-            }
-        } else {
-            foreach ($stage in $script:Failures) { $consecutiveFailures[$stage] = 1 }
+        $prevStreaks = Read-SentinelStreaks -Path $sentinelPath -Field 'consecutive_failures'
+        foreach ($stage in $script:Failures) {
+            $consecutiveFailures[$stage] = 1 + $(if ($prevStreaks.ContainsKey($stage)) { $prevStreaks[$stage] } else { 0 })
         }
     } catch {
         Write-Log "previous sentinel unreadable, streaks restart at 1: $($_.Exception.Message)" 'WARN'
@@ -865,6 +996,11 @@ try {
         max_ingest_lag_sessions = $maxIngestLag
         ingest_stale            = $ingestStale
         gold_freshness          = $goldFreshness
+        # FAILED gold ledger partitions per dataset (claim-failure report); $null
+        # = not measured. A banner, not a failure -- see $ClaimFailureEscalateNights.
+        claim_failures          = $claimFailures
+        # Nights each dataset has held FAILED partitions; drives the escalation.
+        claim_failure_streaks   = $claimFailureStreaks
         # Drives the weekly gate on the NEXT run (see "Weekly gate" above).
         # Advanced only when this run actually ran the weekly stages AND none of
         # them failed — a failed weekly stage must be retried next run, not
